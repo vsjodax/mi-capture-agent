@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <title>VERYS Capture Agent</title>
+  <style>
+    body { font-family: system-ui, sans-serif; width: 260px; margin: 0; padding: 16px; color: #222; }
+    h1 { font-size: 0.95rem; margin: 0 0 4px 0; }
+    .sub { font-size: 0.75rem; color: #666; margin-bottom: 12px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .card { background: #f4f4f5; border-radius: 8px; padding: 10px; }
+    .card .label { font-size: 0.65rem; text-transform: uppercase; color: #666; letter-spacing: 0.03em; }
+    .card .valor { font-size: 1.3rem; font-weight: 700; margin-top: 2px; }
+    .rodape { margin-top: 12px; font-size: 0.7rem; color: #666; }
+    a { color: #1a5fb4; }
+  </style>
+</head>
+<body>
+  <h1>VERYS Capture Agent</h1>
+  <div class="sub">Captação de pedidos do Menu Integrado</div>
+  <div class="grid">
+    <div class="card"><div class="label">Pedidos hoje</div><div class="valor" id="pedidosHoje">—</div></div>
+    <div class="card"><div class="label">Falhas</div><div class="valor" id="falhas">—</div></div>
+  </div>
+  <div class="rodape">Último envio: <span id="ultimoEnvio">—</span></div>
+  <div class="rodape"><a href="options.html" target="_blank">Configurar</a></div>
+  <script src="popup.js"></script>
+</body>
+</html>

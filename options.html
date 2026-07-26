@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <title>VERYS Capture Agent — Configuração</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 480px; margin: 24px auto; color: #222; }
+    h1 { font-size: 1.1rem; }
+    label { display: block; margin-top: 12px; font-size: 0.85rem; font-weight: 600; }
+    input { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; }
+    button { margin-top: 16px; padding: 10px 16px; cursor: pointer; }
+    #status { margin-top: 12px; font-size: 0.85rem; }
+    .ok { color: #1a7f37; }
+    .erro { color: #b31d28; }
+    small { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>VERYS Connect — Capture Agent (Menu Integrado)</h1>
+  <p><small>Configure uma única vez por computador. O token vem da tela de Configurações → Integrações do VERYS ERP.</small></p>
+
+  <label for="miUrl">URL do painel do Menu Integrado (com https://, pode usar * como coringa)</label>
+  <input id="miUrl" type="text" placeholder="https://www.menuintegrado.com.br/panel/franchises/comidavip/*" value="https://www.menuintegrado.com.br/panel/franchises/comidavip/*" />
+  <small>Esta URL é compartilhada por várias marcas/lojas — a extensão captura pedidos de todas, e o VERYS decide (pela marca de cada pedido) quais viram Cliente Mestre. Configure o mapeamento em Configurações → Integrações do ERP.</small>
+
+  <label for="ingestUrl">Endpoint de ingestão (VERYS Connect)</label>
+  <input id="ingestUrl" type="text" placeholder="https://flpbrylskyqaduwodkpf.supabase.co/functions/v1/ingest-mi-order" />
+
+  <label for="token">Token da loja</label>
+  <input id="token" type="password" placeholder="token gerado em Configurações → Integrações" />
+
+  <button id="salvar">Autorizar e salvar</button>
+  <div id="status"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>

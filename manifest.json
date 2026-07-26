@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "VERYS Connect — Capture Agent (Menu Integrado)",
+  "version": "1.0.1",
+  "description": "Captura pedidos reais do Menu Integrado (observando o tráfego que a própria página já faz) e envia para o VERYS Connect, para CRM/RFM/relatórios. Nunca altera nem automatiza nada na tela do Menu Integrado.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["storage", "scripting", "alarms"],
+  "optional_host_permissions": ["*://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "options_page": "options.html"
+}
