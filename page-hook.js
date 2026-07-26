@@ -29,13 +29,45 @@
     window.postMessage({ channel: CHANNEL, payload: pedido }, '*');
   }
 
+  // Modo debug temporário (v1.0.2, calibração em andamento) — imprime no
+  // console NORMAL da página (não no do service worker) as chaves de toda
+  // resposta JSON "candidata" (objeto com mais de 3 chaves, ou array não
+  // vazio de objetos) que a heurística NÃO reconheceu como pedido. Só
+  // assim dá pra achar o formato real de uma tela nova sem precisar caçar
+  // manualmente na aba Rede do DevTools. Remover depois que o formato de
+  // todos os canais (iFood/site/WhatsApp) estiver confirmado.
+  function logDebugCandidato(json) {
+    try {
+      if (Array.isArray(json)) {
+        if (json.length === 0) return;
+        const primeiro = json[0];
+        if (primeiro && typeof primeiro === 'object' && !Array.isArray(primeiro)) {
+          console.log('%c[VERYS DEBUG] array não reconhecido, chaves do 1º item:', 'color:#f59e0b;font-weight:bold', Object.keys(primeiro), primeiro);
+        }
+        return;
+      }
+      if (json && typeof json === 'object' && Object.keys(json).length > 3) {
+        console.log('%c[VERYS DEBUG] objeto não reconhecido, chaves:', 'color:#f59e0b;font-weight:bold', Object.keys(json), json);
+      }
+    } catch {
+      // Nunca deixa o log de debug quebrar nada.
+    }
+  }
+
   function tentarExtrairEEmitir(texto) {
     try {
       const json = JSON.parse(texto);
       if (Array.isArray(json)) {
-        json.filter(pareceUmPedido).forEach(notificar);
+        const reconhecidos = json.filter(pareceUmPedido);
+        if (reconhecidos.length > 0) {
+          reconhecidos.forEach(notificar);
+        } else {
+          logDebugCandidato(json);
+        }
       } else if (pareceUmPedido(json)) {
         notificar(json);
+      } else {
+        logDebugCandidato(json);
       }
     } catch {
       // Resposta não é JSON (HTML, imagem, etc.) — ignora silenciosamente,
