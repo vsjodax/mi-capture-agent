@@ -29,32 +29,30 @@
     window.postMessage({ channel: CHANNEL, payload: pedido }, '*');
   }
 
-  // Modo debug temporário (v1.0.2, calibração em andamento) — imprime no
-  // console NORMAL da página (não no do service worker) as chaves de toda
-  // resposta JSON "candidata" (objeto com mais de 3 chaves, ou array não
-  // vazio de objetos) que a heurística NÃO reconheceu como pedido. Só
-  // assim dá pra achar o formato real de uma tela nova sem precisar caçar
-  // manualmente na aba Rede do DevTools. Remover depois que o formato de
-  // todos os canais (iFood/site/WhatsApp) estiver confirmado.
-  function logDebugCandidato(json) {
+  // Modo debug temporário (v1.0.3, calibração em andamento) — imprime no
+  // console NORMAL da página (não no do service worker) toda resposta JSON
+  // que a heurística NÃO reconheceu como pedido, junto com a URL de onde
+  // veio. Deliberadamente pouco filtrado (até objetos de 1 chave só, ex.:
+  // {"detailsHTML": "..."}) — a v1.0.2 filtrava demais (só >3 chaves) e
+  // escondeu justamente o formato real, que é bem enxuto. Remover depois
+  // que o formato de todos os canais (iFood/site/WhatsApp) estiver
+  // confirmado.
+  function logDebugCandidato(url, json) {
     try {
       if (Array.isArray(json)) {
         if (json.length === 0) return;
-        const primeiro = json[0];
-        if (primeiro && typeof primeiro === 'object' && !Array.isArray(primeiro)) {
-          console.log('%c[VERYS DEBUG] array não reconhecido, chaves do 1º item:', 'color:#f59e0b;font-weight:bold', Object.keys(primeiro), primeiro);
-        }
+        console.log('%c[VERYS DEBUG] array (' + json.length + ' itens) — ' + url, 'color:#f59e0b;font-weight:bold', json);
         return;
       }
-      if (json && typeof json === 'object' && Object.keys(json).length > 3) {
-        console.log('%c[VERYS DEBUG] objeto não reconhecido, chaves:', 'color:#f59e0b;font-weight:bold', Object.keys(json), json);
+      if (json && typeof json === 'object' && Object.keys(json).length > 0) {
+        console.log('%c[VERYS DEBUG] objeto, chaves ' + JSON.stringify(Object.keys(json)) + ' — ' + url, 'color:#f59e0b;font-weight:bold', json);
       }
     } catch {
       // Nunca deixa o log de debug quebrar nada.
     }
   }
 
-  function tentarExtrairEEmitir(texto) {
+  function tentarExtrairEEmitir(url, texto) {
     try {
       const json = JSON.parse(texto);
       if (Array.isArray(json)) {
@@ -62,12 +60,12 @@
         if (reconhecidos.length > 0) {
           reconhecidos.forEach(notificar);
         } else {
-          logDebugCandidato(json);
+          logDebugCandidato(url, json);
         }
       } else if (pareceUmPedido(json)) {
         notificar(json);
       } else {
-        logDebugCandidato(json);
+        logDebugCandidato(url, json);
       }
     } catch {
       // Resposta não é JSON (HTML, imagem, etc.) — ignora silenciosamente,
@@ -80,10 +78,11 @@
   window.fetch = async function (...args) {
     const resposta = await fetchOriginal.apply(this, args);
     try {
+      const url = (args[0] && args[0].url) || String(args[0] || '');
       resposta
         .clone()
         .text()
-        .then(tentarExtrairEEmitir)
+        .then((texto) => tentarExtrairEEmitir(url, texto))
         .catch(() => {});
     } catch {
       // Nunca deixa a observação quebrar a chamada real do Menu Integrado.
@@ -95,14 +94,15 @@
   const xhrOpenOriginal = XMLHttpRequest.prototype.open;
   const xhrSendOriginal = XMLHttpRequest.prototype.send;
 
-  XMLHttpRequest.prototype.open = function (...args) {
-    return xhrOpenOriginal.apply(this, args);
+  XMLHttpRequest.prototype.open = function (_method, url, ...resto) {
+    this._verysUrl = url;
+    return xhrOpenOriginal.apply(this, [_method, url, ...resto]);
   };
 
   XMLHttpRequest.prototype.send = function (...args) {
     this.addEventListener('load', () => {
       try {
-        if (typeof this.responseText === 'string') tentarExtrairEEmitir(this.responseText);
+        if (typeof this.responseText === 'string') tentarExtrairEEmitir(this._verysUrl || '', this.responseText);
       } catch {
         // Idem — nunca interfere na requisição real.
       }
