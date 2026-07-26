@@ -37,16 +37,15 @@
   // escondeu justamente o formato real, que é bem enxuto. Remover depois
   // que o formato de todos os canais (iFood/site/WhatsApp) estiver
   // confirmado.
+  // Imprime como TEXTO PURO (não como objeto inspecionável) — assim dá pra
+  // copiar clicando com o botão direito na linha → "Copy message", sem
+  // precisar expandir nada na árvore do console (difícil para quem não usa
+  // DevTools no dia a dia).
   function logDebugCandidato(url, json) {
     try {
-      if (Array.isArray(json)) {
-        if (json.length === 0) return;
-        console.log('%c[VERYS DEBUG] array (' + json.length + ' itens) — ' + url, 'color:#f59e0b;font-weight:bold', json);
-        return;
-      }
-      if (json && typeof json === 'object' && Object.keys(json).length > 0) {
-        console.log('%c[VERYS DEBUG] objeto, chaves ' + JSON.stringify(Object.keys(json)) + ' — ' + url, 'color:#f59e0b;font-weight:bold', json);
-      }
+      if (Array.isArray(json) && json.length === 0) return;
+      if (!Array.isArray(json) && (!json || typeof json !== 'object' || Object.keys(json).length === 0)) return;
+      console.log('[VERYS DEBUG] ' + url + ' => ' + JSON.stringify(json));
     } catch {
       // Nunca deixa o log de debug quebrar nada.
     }
