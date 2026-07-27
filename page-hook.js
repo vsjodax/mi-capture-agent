@@ -18,14 +18,42 @@
 (() => {
   const CHANNEL = 'verys-mi-capture';
 
-  // DIAGNÓSTICO TEMPORÁRIO (remover depois de confirmar).
-  try {
-    const faixa = document.createElement('div');
-    faixa.textContent = 'VERYS EXTENSION ATIVA NESTA PÁGINA';
-    faixa.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;background:#e6007e;color:#fff;text-align:center;padding:6px;font-family:sans-serif;font-weight:bold;';
-    (document.body || document.documentElement).appendChild(faixa);
-  } catch {
-    // Nunca deixa o diagnóstico quebrar nada.
+  // PAINEL DE DIAGNÓSTICO TEMPORÁRIO (remover depois de confirmar o
+  // formato real) — mostra direto na página, sem precisar abrir DevTools:
+  // quantas respostas JSON foram vistas, quantas foram reconhecidas como
+  // pedido, e um resumo das últimas não reconhecidas.
+  let totalVistos = 0;
+  let totalReconhecidos = 0;
+  const ultimasNaoReconhecidas = [];
+  let painelEl = null;
+
+  function montarPainel() {
+    try {
+      painelEl = document.createElement('div');
+      painelEl.style.cssText =
+        'position:fixed;top:0;right:0;z-index:999999;background:#111;color:#0f0;font:11px monospace;padding:8px;max-width:420px;max-height:260px;overflow:auto;border:2px solid #e6007e;white-space:pre-wrap;';
+      painelEl.textContent = 'VERYS DEBUG — aguardando respostas...';
+      (document.body || document.documentElement).appendChild(painelEl);
+    } catch {
+      // Nunca deixa o diagnóstico quebrar nada.
+    }
+  }
+
+  function atualizarPainel() {
+    if (!painelEl) return;
+    try {
+      const linhas = [`VERYS DEBUG — vistos: ${totalVistos} | reconhecidos: ${totalReconhecidos}`, '--- últimas não reconhecidas ---'];
+      ultimasNaoReconhecidas.forEach((item) => linhas.push(item));
+      painelEl.textContent = linhas.join('\n');
+    } catch {
+      // idem
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', montarPainel);
+  } else {
+    montarPainel();
   }
 
   function pareceUmPedido(obj) {
@@ -55,7 +83,13 @@
     try {
       if (Array.isArray(json) && json.length === 0) return;
       if (!Array.isArray(json) && (!json || typeof json !== 'object' || Object.keys(json).length === 0)) return;
-      console.log('[VERYS DEBUG] ' + url + ' => ' + JSON.stringify(json));
+      const texto = JSON.stringify(json);
+      console.log('[VERYS DEBUG] ' + url + ' => ' + texto);
+
+      const resumo = `${url.slice(-60)} => ${texto.slice(0, 200)}`;
+      ultimasNaoReconhecidas.unshift(resumo);
+      if (ultimasNaoReconhecidas.length > 6) ultimasNaoReconhecidas.pop();
+      atualizarPainel();
     } catch {
       // Nunca deixa o log de debug quebrar nada.
     }
@@ -64,14 +98,19 @@
   function tentarExtrairEEmitir(url, texto) {
     try {
       const json = JSON.parse(texto);
+      totalVistos += 1;
       if (Array.isArray(json)) {
         const reconhecidos = json.filter(pareceUmPedido);
         if (reconhecidos.length > 0) {
+          totalReconhecidos += reconhecidos.length;
+          atualizarPainel();
           reconhecidos.forEach(notificar);
         } else {
           logDebugCandidato(url, json);
         }
       } else if (pareceUmPedido(json)) {
+        totalReconhecidos += 1;
+        atualizarPainel();
         notificar(json);
       } else {
         logDebugCandidato(url, json);
