@@ -90,10 +90,11 @@
       // completo (sem corte) pra dar pra extrair cliente/telefone/itens
       // de dentro do HTML. Qualquer outra coisa continua cortada, só
       // pra não lotar o painel com ruído (ex.: payment_methods).
-      const limite = (!Array.isArray(json) && json && typeof json.detailsHTML === 'string') ? 4000 : 200;
+      const limite = (!Array.isArray(json) && json && typeof json.detailsHTML === 'string') ? 20000 : 200;
       const resumo = `${url.slice(-60)} => ${texto.slice(0, limite)}`;
       ultimasNaoReconhecidas.unshift(resumo);
-      if (ultimasNaoReconhecidas.length > 3) ultimasNaoReconhecidas.pop();
+      const maximo = limite > 1000 ? 1 : 3;
+      while (ultimasNaoReconhecidas.length > maximo) ultimasNaoReconhecidas.pop();
       atualizarPainel();
     } catch {
       // Nunca deixa o log de debug quebrar nada.
