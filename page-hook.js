@@ -86,9 +86,14 @@
       const texto = JSON.stringify(json);
       console.log('[VERYS DEBUG] ' + url + ' => ' + texto);
 
-      const resumo = `${url.slice(-60)} => ${texto.slice(0, 200)}`;
+      // detailsHTML é o dado que estamos calibrando agora — mostra
+      // completo (sem corte) pra dar pra extrair cliente/telefone/itens
+      // de dentro do HTML. Qualquer outra coisa continua cortada, só
+      // pra não lotar o painel com ruído (ex.: payment_methods).
+      const limite = (!Array.isArray(json) && json && typeof json.detailsHTML === 'string') ? 4000 : 200;
+      const resumo = `${url.slice(-60)} => ${texto.slice(0, limite)}`;
       ultimasNaoReconhecidas.unshift(resumo);
-      if (ultimasNaoReconhecidas.length > 6) ultimasNaoReconhecidas.pop();
+      if (ultimasNaoReconhecidas.length > 3) ultimasNaoReconhecidas.pop();
       atualizarPainel();
     } catch {
       // Nunca deixa o log de debug quebrar nada.
