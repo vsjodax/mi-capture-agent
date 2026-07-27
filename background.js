@@ -28,36 +28,6 @@ async function atualizarStats(patch) {
   return novo;
 }
 
-// Registra o par de scripts (page-hook no MAIN world + content-script no
-// isolated world) dinamicamente para o domínio configurado pelo usuário —
-// nunca hardcoded no manifest.json, porque o domínio do Menu Integrado
-// varia por instalação. Chamado pela tela de opções depois que a
-// permissão de host é concedida (chrome.permissions.request).
-async function registrarScriptsParaDominio(urlPattern) {
-  try {
-    await chrome.scripting.unregisterContentScripts({ ids: ['mi-capture-hook', 'mi-capture-relay'] });
-  } catch {
-    // Nenhum script registrado ainda — primeira configuração, ignora.
-  }
-
-  await chrome.scripting.registerContentScripts([
-    {
-      id: 'mi-capture-hook',
-      matches: [urlPattern],
-      js: ['page-hook.js'],
-      world: 'MAIN',
-      runAt: 'document_start',
-    },
-    {
-      id: 'mi-capture-relay',
-      matches: [urlPattern],
-      js: ['content-script.js'],
-      world: 'ISOLATED',
-      runAt: 'document_start',
-    },
-  ]);
-}
-
 async function enviarParaIngest(payload) {
   const config = await getConfig();
   if (!config?.ingestUrl || !config?.token) {
@@ -94,11 +64,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'pedido_observado') {
     enviarParaIngest(message.payload).then(() => sendResponse({ ok: true }));
     return true; // resposta assíncrona
-  }
-
-  if (message?.type === 'configurar_dominio') {
-    registrarScriptsParaDominio(message.urlPattern).then(() => sendResponse({ ok: true }));
-    return true;
   }
 
   if (message?.type === 'obter_stats') {

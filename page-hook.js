@@ -18,6 +18,16 @@
 (() => {
   const CHANNEL = 'verys-mi-capture';
 
+  // DIAGNÓSTICO TEMPORÁRIO (remover depois de confirmar).
+  try {
+    const faixa = document.createElement('div');
+    faixa.textContent = 'VERYS EXTENSION ATIVA NESTA PÁGINA';
+    faixa.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;background:#e6007e;color:#fff;text-align:center;padding:6px;font-family:sans-serif;font-weight:bold;';
+    (document.body || document.documentElement).appendChild(faixa);
+  } catch {
+    // Nunca deixa o diagnóstico quebrar nada.
+  }
+
   function pareceUmPedido(obj) {
     if (!obj || typeof obj !== 'object') return false;
     return typeof obj.id === 'string'

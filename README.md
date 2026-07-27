@@ -37,14 +37,21 @@ interna de empresa:
 5. Clique no ícone da extensão → "Configurar" (ou clique com o botão
    direito no ícone → Opções).
 6. Preencha:
-   - **URL do Menu Integrado**: o domínio do painel, com `/*` no final
-     (ex.: `https://painel.exemplo.com.br/*`).
    - **Endpoint de ingestão**: `https://flpbrylskyqaduwodkpf.supabase.co/functions/v1/ingest-mi-order`
    - **Token da loja**: gerado em Configurações → Integrações do VERYS ERP.
-7. Clique em "Autorizar e salvar" — o Chrome vai pedir para confirmar a
-   permissão de acesso àquele domínio especificamente (nunca acesso
-   amplo por padrão).
+7. Clique em "Salvar".
 8. Recarregue a aba do Menu Integrado.
+
+A extensão já observa automaticamente qualquer painel em
+`menuintegrado.com.br` (declarado direto no `manifest.json`) — não precisa
+informar URL nem autorizar domínio manualmente. Essa decisão foi revista
+em 2026-07-27: a versão anterior registrava os scripts dinamicamente para
+um domínio configurável pelo usuário (`chrome.scripting.registerContentScripts`),
+mas esse registro se perdia silenciosamente a cada reload da extensão em
+modo desenvolvedor, exigindo reconfiguração manual toda vez — trocado por
+uma declaração estática no manifest (mais simples e confiável), já que o
+domínio do Menu Integrado nunca varia de fato entre instalações, só o
+caminho da franquia.
 
 ## Uma URL, várias marcas — mapeamento no VERYS, não na extensão
 
@@ -95,9 +102,9 @@ função `pareceUmPedido` conforme o formato real observado.
 
 ## Estrutura
 
-- `manifest.json` — permissões mínimas; nenhum domínio fixo (o domínio do
-  Menu Integrado é configurado pelo usuário na tela de Opções, nunca
-  hardcoded).
+- `manifest.json` — permissões mínimas; domínio fixo em
+  `*.menuintegrado.com.br` (ver nota acima sobre por que deixou de ser
+  configurável pelo usuário).
 - `page-hook.js` — roda no MAIN world da página (só assim enxerga o mesmo
   `fetch`/`XMLHttpRequest` que o Menu Integrado usa); observa respostas,
   nunca modifica.
