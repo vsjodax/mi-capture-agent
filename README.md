@@ -89,6 +89,19 @@ importar para a lógica (a validação do telefone já filtra o que interessa
 independente do canal), mas fica registrado aqui caso surja algo
 inesperado.
 
+**Calibração da tela de detalhe (v1.0.9, 2026-07-27)**: a resposta da
+tela de detalhe do pedido (`orders/<uuid>.json`) NÃO é o objeto plano
+acima — é só `{ detailsHTML: "<div>...</div>" }`, um HTML pronto pra
+exibir. Só que esse HTML esconde um componente React
+(`data-name="CompleteOrder"`) cujo atributo `data-attributes` carrega o
+pedido inteiro como JSON (com entities HTML — `&quot;` no lugar de `"`).
+`page-hook.js` extrai e decodifica esse atributo, e normaliza os campos
+pro mesmo formato do caso acima antes de notificar — inclusive
+`merchant.name`, que aqui usa o "slug" da marca (`rootResource.slug`,
+ex.: `"hiperchefpizza"`) em vez de um nome de exibição, por ser mais
+estável (sem variação de digitação/acentuação) — é esse valor que deve
+ser cadastrado em `mi_marcas_lojas` no VERYS.
+
 ## Verificando que está funcionando
 
 Clique no ícone da extensão a qualquer momento — mostra pedidos

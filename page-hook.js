@@ -6,55 +6,22 @@
 // acontecer de qualquer forma. Nunca dispara nenhuma requisição nova,
 // nunca clica em nada, nunca envia nada como se fosse o usuário.
 //
-// Heurística de reconhecimento de "isso parece um pedido" — calibrada em
-// 2026-07-25 contra tráfego REAL (payloads de pedido do iFood via Menu
-// Integrado, confirmados pelo usuário). Formato real do objeto de pedido:
-// { id, displayId, createdAt, salesChannel, merchant: {id, name},
-//   customer: {id, name, phone: {number}}, items: [...], total: {...} }
-// — bem diferente da suposição inicial (uuid/customer_phone soltos); não
-// existe wrapper {event, order}, o pedido É o objeto raiz. A própria
-// resposta pode ser um pedido único (tela de detalhe) ou um array de
-// pedidos (tela de lista) — os dois casos são tratados abaixo.
+// Duas formas reais de pedido confirmadas contra tráfego real:
+//
+// 1) Objeto plano (ou array deles), calibrado em 2026-07-25:
+//    { id, displayId, createdAt, salesChannel, merchant: {id, name},
+//      customer: {id, name, phone: {number}}, items: [...], total: {...} }
+//
+// 2) Tela de detalhe do pedido (calibrado em 2026-07-27): a resposta é só
+//    { detailsHTML: "<div>...</div>" } — um HTML pronto pra exibir, SEM
+//    dado estruturado direto. Mas escondido dentro desse HTML existe um
+//    componente React (data-name="CompleteOrder") cujo atributo
+//    data-attributes carrega o pedido INTEIRO como JSON (cliente,
+//    telefone, endereço completo, itens, pagamentos, motoboy, cupom) —
+//    é de lá que os dados são extraídos abaixo, normalizados pro mesmo
+//    formato do caso (1) antes de notificar.
 (() => {
   const CHANNEL = 'verys-mi-capture';
-
-  // PAINEL DE DIAGNÓSTICO TEMPORÁRIO (remover depois de confirmar o
-  // formato real) — mostra direto na página, sem precisar abrir DevTools:
-  // quantas respostas JSON foram vistas, quantas foram reconhecidas como
-  // pedido, e um resumo das últimas não reconhecidas.
-  let totalVistos = 0;
-  let totalReconhecidos = 0;
-  const ultimasNaoReconhecidas = [];
-  let painelEl = null;
-
-  function montarPainel() {
-    try {
-      painelEl = document.createElement('div');
-      painelEl.style.cssText =
-        'position:fixed;top:0;right:0;z-index:999999;background:#111;color:#0f0;font:11px monospace;padding:8px;max-width:420px;max-height:260px;overflow:auto;border:2px solid #e6007e;white-space:pre-wrap;';
-      painelEl.textContent = 'VERYS DEBUG — aguardando respostas...';
-      (document.body || document.documentElement).appendChild(painelEl);
-    } catch {
-      // Nunca deixa o diagnóstico quebrar nada.
-    }
-  }
-
-  function atualizarPainel() {
-    if (!painelEl) return;
-    try {
-      const linhas = [`VERYS DEBUG — vistos: ${totalVistos} | reconhecidos: ${totalReconhecidos}`, '--- últimas não reconhecidas ---'];
-      ultimasNaoReconhecidas.forEach((item) => linhas.push(item));
-      painelEl.textContent = linhas.join('\n');
-    } catch {
-      // idem
-    }
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', montarPainel);
-  } else {
-    montarPainel();
-  }
 
   function pareceUmPedido(obj) {
     if (!obj || typeof obj !== 'object') return false;
@@ -67,59 +34,60 @@
     window.postMessage({ channel: CHANNEL, payload: pedido }, '*');
   }
 
-  // Modo debug temporário (v1.0.3, calibração em andamento) — imprime no
-  // console NORMAL da página (não no do service worker) toda resposta JSON
-  // que a heurística NÃO reconheceu como pedido, junto com a URL de onde
-  // veio. Deliberadamente pouco filtrado (até objetos de 1 chave só, ex.:
-  // {"detailsHTML": "..."}) — a v1.0.2 filtrava demais (só >3 chaves) e
-  // escondeu justamente o formato real, que é bem enxuto. Remover depois
-  // que o formato de todos os canais (iFood/site/WhatsApp) estiver
-  // confirmado.
-  // Imprime como TEXTO PURO (não como objeto inspecionável) — assim dá pra
-  // copiar clicando com o botão direito na linha → "Copy message", sem
-  // precisar expandir nada na árvore do console (difícil para quem não usa
-  // DevTools no dia a dia).
-  function logDebugCandidato(url, json) {
+  // Extrai o bloco de dados estruturados escondido dentro do detailsHTML.
+  // O valor do atributo vem com entities HTML (&quot; no lugar de ") em
+  // vez de aspas literais, por isso o decode manual antes do JSON.parse.
+  function extrairOrderDoDetailsHTML(html) {
+    const match = html.match(/data-name="CompleteOrder"\s+data-attributes="([^"]*)"/);
+    if (!match) return null;
+    const decodificado = match[1]
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&');
     try {
-      if (Array.isArray(json) && json.length === 0) return;
-      if (!Array.isArray(json) && (!json || typeof json !== 'object' || Object.keys(json).length === 0)) return;
-      const texto = JSON.stringify(json);
-      console.log('[VERYS DEBUG] ' + url + ' => ' + texto);
-
-      // detailsHTML é o dado que estamos calibrando agora — mostra
-      // completo (sem corte) pra dar pra extrair cliente/telefone/itens
-      // de dentro do HTML. Qualquer outra coisa continua cortada, só
-      // pra não lotar o painel com ruído (ex.: payment_methods).
-      const limite = (!Array.isArray(json) && json && typeof json.detailsHTML === 'string') ? 20000 : 200;
-      const resumo = `${url.slice(-60)} => ${texto.slice(0, limite)}`;
-      ultimasNaoReconhecidas.unshift(resumo);
-      const maximo = limite > 1000 ? 1 : 3;
-      while (ultimasNaoReconhecidas.length > maximo) ultimasNaoReconhecidas.pop();
-      atualizarPainel();
+      const parsed = JSON.parse(decodificado);
+      return parsed && parsed.order ? parsed.order : null;
     } catch {
-      // Nunca deixa o log de debug quebrar nada.
+      return null;
     }
   }
 
-  function tentarExtrairEEmitir(url, texto) {
+  // merchant.name usa rootResource.slug (ex.: "hiperchefpizza") em vez de
+  // um nome de exibição — é um identificador estável, sem variação de
+  // digitação, e é o que fica configurado em mi_marcas_lojas no VERYS.
+  function normalizarPedido(order) {
+    return {
+      id: order.uuid,
+      displayId: order.code,
+      createdAt: order.createdAt,
+      salesChannel: order.channel,
+      merchant: { id: order.rootResource?.slug ?? '', name: order.rootResource?.slug ?? '' },
+      customer: {
+        id: order.customer?.uuid ?? '',
+        name: order.customer?.name ?? '',
+        phone: { number: order.mobilePhone ?? '' },
+      },
+      items: order.items ?? [],
+      total: { subTotal: order.subtotal, orderAmount: order.total },
+    };
+  }
+
+  function tentarExtrairEEmitir(_url, texto) {
     try {
       const json = JSON.parse(texto);
-      totalVistos += 1;
       if (Array.isArray(json)) {
-        const reconhecidos = json.filter(pareceUmPedido);
-        if (reconhecidos.length > 0) {
-          totalReconhecidos += reconhecidos.length;
-          atualizarPainel();
-          reconhecidos.forEach(notificar);
-        } else {
-          logDebugCandidato(url, json);
-        }
-      } else if (pareceUmPedido(json)) {
-        totalReconhecidos += 1;
-        atualizarPainel();
+        json.filter(pareceUmPedido).forEach(notificar);
+        return;
+      }
+      if (pareceUmPedido(json)) {
         notificar(json);
-      } else {
-        logDebugCandidato(url, json);
+        return;
+      }
+      if (json && typeof json.detailsHTML === 'string') {
+        const order = extrairOrderDoDetailsHTML(json.detailsHTML);
+        if (order) notificar(normalizarPedido(order));
       }
     } catch {
       // Resposta não é JSON (HTML, imagem, etc.) — ignora silenciosamente,
