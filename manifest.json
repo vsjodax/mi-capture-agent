@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "VERYS Connect — Capture Agent (Menu Integrado)",
-  "version": "1.6.6",
-  "description": "Captura pedidos reais do Menu Integrado (observando o tráfego que a própria página já faz) e envia para o VERYS Connect, para CRM/RFM/relatórios. Nunca altera nem automatiza nada na tela do Menu Integrado.",
+  "version": "1.6.7",
+  "description": "Captura pedidos reais do Menu Integrado (observando o tráfego que a própria página já faz) e envia para o VERYS Connect, para CRM/RFM/relatórios. Nunca altera nem automatiza nada na tela do Menu Integrado. v1.6.7: envio fica pendente e é reenviado automaticamente quando o VERYS recusa ou sincroniza parcialmente (nunca mais descarta silenciosamente).",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
