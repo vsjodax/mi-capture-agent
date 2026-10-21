@@ -53,6 +53,23 @@ uma declaração estática no manifest (mais simples e confiável), já que o
 domínio do Menu Integrado nunca varia de fato entre instalações, só o
 caminho da franquia.
 
+## Atualizando uma instalação existente (preserva endpoint e token salvos)
+
+1. Baixe o novo pacote e extraia **por cima da mesma pasta** onde a
+   versão anterior já estava instalada (não crie uma pasta nova nem
+   aponte o Chrome para outro lugar).
+2. Em `chrome://extensions`, localize a extensão e clique no ícone de
+   recarregar (↻) do card dela — ou em "Detalhes" → "Recarregar".
+3. Confirme a versão nova no próprio card da extensão.
+
+**Por quê "mesma pasta" importa**: no modo desenvolvedor, o Chrome
+identifica a extensão pela pasta registrada — extrair numa pasta nova cria
+uma instalação à parte, com `chrome.storage.local` vazio, perdendo o
+endpoint e o token da loja já configurados (exigindo reconfigurar do
+zero). Sobrescrevendo os arquivos na mesma pasta e só recarregando, a
+configuração salva continua exatamente como estava — nenhuma ação nas
+Opções é necessária após atualizar.
+
 ## Uma URL, várias marcas — mapeamento no VERYS, não na extensão
 
 A URL do painel do Menu Integrado usada no dia a dia é **compartilhada
