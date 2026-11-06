@@ -147,12 +147,60 @@
     return { todasAsChaves: Object.keys(order), candidatos };
   }
 
+  // DIAGNÓSTICO TEMPORÁRIO (investigação 2026-11-05) — mesmo padrão e
+  // mesmo motivo de capturarDebugMotoboy: dá pra consultar o resultado
+  // direto em mi_pedidos_capturados.payload_bruto, sem precisar publicar
+  // nada. Objetivo: achar qual propriedade do pedido real do MI distingue
+  // Balcão/Telefone/WhatsApp/Site/marketplace e Delivery/Retirar no local
+  // -- salesChannel sozinho (testado contra tráfego real em 2026-11-05)
+  // não distingue (Balcão e retirada-iFood usam o mesmo valor 'counter'),
+  // e deliveryMethod/tableName vieram null mesmo num pedido de teste criado
+  // explicitamente como Balcão + Retirar no local.
+  //
+  // `valoresReais`: só campos confirmadamente estruturados (enum curto de
+  // catálogo interno do MI ou booleano) -- nunca texto digitado por
+  // cliente/operador, nunca dado de pagamento. `channel` é o MESMO valor
+  // que já vira `salesChannel` abaixo (duplicado aqui só pra manter os dois
+  // nomes pedidos lado a lado no diagnóstico, sem mudar o que é enviado).
+  //
+  // `estruturaSomente`: campos candidatos que SÃO potencialmente texto
+  // livre/dado sensível (observação do operador, referência de endereço,
+  // dado de cartão, descrição livre) -- nunca grava o conteúdo, só se a
+  // chave existe e qual o `typeof` do valor. Suficiente pra saber se vale
+  // a pena investigar mais, sem guardar informação pessoal/financeira.
+  //
+  // REMOVER este bloco (e o campo _debugCanalModalidade abaixo) depois que
+  // o mapeamento real de canal/modalidade estiver decidido e implementado.
+  function capturarDebugCanalModalidade(order) {
+    const valoresReais = {
+      channel: order.channel ?? null,
+      productChannel: order.productChannel ?? null,
+      canUpdateSchedule: typeof order.canUpdateSchedule === 'boolean' ? order.canUpdateSchedule : null,
+      needsCutlery: typeof order.needsCutlery === 'boolean' ? order.needsCutlery : null,
+      onTrust: typeof order.onTrust === 'boolean' ? order.onTrust : null,
+    };
+    const estruturaSomente = {};
+    ['observations', 'reference', 'card', 'description'].forEach((chave) => {
+      const valor = order[chave];
+      const ausente = valor === undefined || valor === null;
+      estruturaSomente[chave] = { presente: !ausente, tipo: ausente ? null : typeof valor };
+    });
+    return { valoresReais, estruturaSomente };
+  }
+
   function normalizarPedido(order) {
     return {
       id: order.uuid,
       displayId: order.code,
       createdAt: order.createdAt,
       salesChannel: order.channel,
+      // Canal do produto ('internal' = manual/Balcão-Telefone, 'marketplace'
+      // = iFood/99Food/etc.) -- mapeamento decidido em 2026-11-05, promovido
+      // pra nível raiz (mesmo padrão de deliveryMethod/tableName acima) pra
+      // ingest-mi-order poder ler payload.productChannel direto. Continua
+      // também em _debugCanalModalidade.valoresReais.productChannel (não
+      // duplicar lógica, só o valor).
+      productChannel: order.productChannel ?? null,
       merchant: { id: order.rootResource?.slug ?? '', name: order.rootResource?.slug ?? '' },
       customer: {
         id: order.customer?.uuid ?? '',
@@ -168,7 +216,20 @@
       // direto do campo booleano do próprio pedido (sempre presente),
       // pra nunca depender só da tabela de histórico pra saber disso.
       cancelled: !!order.cancelled,
+      // Modalidade de entrega (Delivery/Retirar no local/Servir na mesa) e
+      // nome/número da mesa — chaves confirmadas presentes no objeto real
+      // via _debugMotoboy.todasAsChaves (achado 2026-11-05), nunca extraídas
+      // até agora. AINDA NÃO CALIBRADO contra tráfego real (não sabemos o
+      // formato exato dos valores de deliveryMethod) — só captura por
+      // enquanto, mesmo padrão de order.missingPayment acima: nunca decide
+      // nada no Verys ainda, só observa. `?? null` em vez de omitir a chave
+      // porque a tela de lista (que não passa por normalizarPedido) nunca
+      // teve esses campos mesmo — aqui é só a tela de detalhe, onde a
+      // ausência é tão informativa quanto a presença.
+      deliveryMethod: order.deliveryMethod ?? null,
+      tableName: order.tableName ?? null,
       _debugMotoboy: capturarDebugMotoboy(order),
+      _debugCanalModalidade: capturarDebugCanalModalidade(order),
     };
   }
 
