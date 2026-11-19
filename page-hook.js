@@ -132,6 +132,20 @@
     };
   }
 
+  // Código do cupom aplicado no pedido — `order.couponCode`, chave
+  // confirmada presente em 100% dos pedidos reais (2.713 em 30 dias, via
+  // _debugMotoboy.todasAsChaves, levantamento 2026-11-19). O VALOR nunca foi
+  // observado (payload_bruto só guarda os nomes das chaves), então só aceita
+  // texto não vazio: qualquer outro formato (null, número, objeto) vira null,
+  // nunca um valor inventado. Alimenta pedidos.cupom_codigo no VERYS
+  // (ingest-mi-order) para a atribuição "cupom comprovado" da jornada do CRM.
+  // `order.coupon` (objeto, só em alguns pedidos) e `couponDiscount` ficam de
+  // fora até o formato real ser conferido.
+  function normalizarCupom(order) {
+    const codigo = typeof order.couponCode === 'string' ? order.couponCode.trim() : '';
+    return codigo ? codigo : null;
+  }
+
   // DIAGNÓSTICO TEMPORÁRIO — mantido como rede de segurança enquanto
   // normalizarMotoboy() é confirmado contra mais pedidos reais (captura
   // passa pelo ingest-mi-order sem mudança nenhuma, já que ele grava
@@ -212,6 +226,7 @@
       payment: normalizarPagamento(order),
       address: normalizarEndereco(order),
       motoboy: normalizarMotoboy(order),
+      couponCode: normalizarCupom(order),
       // Pedido cancelado nunca chega a "Entregue" no histórico — sinal
       // direto do campo booleano do próprio pedido (sempre presente),
       // pra nunca depender só da tabela de histórico pra saber disso.

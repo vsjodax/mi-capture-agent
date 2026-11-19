@@ -94,6 +94,11 @@ function criarSandbox() {
       await sandbox.window.fetch('https://menuintegrado.exemplo/orders/detail');
       await esperarMicrotasks();
     },
+    async dispararDetalheHtml(detailsHTML) {
+      respostasFetchPendentes.push({ detailsHTML });
+      await sandbox.window.fetch('https://menuintegrado.exemplo/orders/detail');
+      await esperarMicrotasks();
+    },
     async dispararLista(objListaOuArray) {
       respostasFetchPendentes.push(objListaOuArray);
       await sandbox.window.fetch('https://menuintegrado.exemplo/orders');
@@ -349,6 +354,82 @@ async function rodarCenarios() {
     } else {
       falhar(`forma de lista deveria ser repassada sem alteração, veio diferente: ${JSON.stringify(payload)}`);
     }
+  }
+
+  // ---- CENÁRIO 5: couponCode (v1.6.9) -- texto vira código limpo; o resto vira null ----
+  {
+    const casos = [
+      ['código simples', { couponCode: 'VOLTA10' }, 'VOLTA10'],
+      ['espaços nas pontas', { couponCode: '  volta15 ' }, 'volta15'],
+      ['string vazia', { couponCode: '   ' }, null],
+      ['null explícito', { couponCode: null }, null],
+      ['número (formato inesperado)', { couponCode: 123 }, null],
+      ['objeto (formato inesperado)', { couponCode: { code: 'X' } }, null],
+      ['chave ausente', {}, null],
+    ];
+    for (const [nome, extra, esperado] of casos) {
+      const { mensagensPostadas, dispararDetalhe } = criarSandbox();
+      await dispararDetalhe(pedidoDetalheBase(extra));
+      const p = mensagensPostadas[0]?.payload;
+      if (p && p.couponCode === esperado && 'couponCode' in p) {
+        ok(`couponCode (${nome}) -> ${JSON.stringify(esperado)}`);
+      } else {
+        falhar(`couponCode (${nome}): esperado ${JSON.stringify(esperado)}, obtido ${JSON.stringify(p?.couponCode)}`);
+      }
+    }
+    // `coupon` (objeto) e `couponDiscount` não alimentam couponCode.
+    {
+      const { mensagensPostadas, dispararDetalhe } = criarSandbox();
+      await dispararDetalhe(pedidoDetalheBase({ couponCode: null, coupon: { code: 'OUTRO' }, couponDiscount: 5 }));
+      const p = mensagensPostadas[0]?.payload;
+      if (p?.couponCode === null) ok('coupon (objeto) e couponDiscount não são usados como código (formato ainda não conferido).');
+      else falhar(`couponCode deveria ser null quando só há coupon/couponDiscount, obtido ${JSON.stringify(p?.couponCode)}`);
+    }
+  }
+
+  // ---- CENÁRIO 6: com cupom, pagamento/endereço/motoboy/status chegam idênticos ao pedido sem cupom ----
+  {
+    const html = '<table><tr><td><small>Recebido</small></td><td class="pl-2">18:01</td></tr>'
+      + '<tr><td><small>Produzindo</small></td><td class="pl-2">18:05</td></tr>'
+      + '<tr><td><small>Enviado</small></td><td class="pl-2">18:40</td></tr>'
+      + '<tr><td><small>Entregue</small></td><td class="pl-2">19:02</td></tr></table>';
+    const extra = {
+      createdAt: '2026-11-19T18:00:00.000-03:00',
+      payments: [{ methodLabel: 'Dinheiro', provider: { sku: 'delivery' }, needsChange: true, changeFor: 100 }],
+      missingPayment: true,
+      street: 'Rua das Flores', number: '120', complement: 'Apto 3', neighborhood: 'Velha', reference: 'Perto da praça', city: 'Blumenau',
+      motoboy: { name: 'Valmir Silva', mobilePhone: '(47) 98888-0000', uuid: 'motoboy-uuid-1', cost: 7 },
+      cancelled: false,
+    };
+    // Mesmo caminho real (fetch interceptado -> detailsHTML), com a tabela de
+    // status anexada ao HTML do detalhe.
+    const semCupom = criarSandbox();
+    const comCupom = criarSandbox();
+    await semCupom.dispararDetalheHtml(montarDetailsHtml(pedidoDetalheBase(extra)) + html);
+    await comCupom.dispararDetalheHtml(montarDetailsHtml(pedidoDetalheBase({ ...extra, couponCode: 'VOLTA10' })) + html);
+    const a = semCupom.mensagensPostadas[0]?.payload;
+    const b = comCupom.mensagensPostadas[0]?.payload;
+    const campos = ['payment', 'address', 'motoboy', 'statusHistory', 'previsaoEntrega', 'cancelled', 'total', 'customer', 'items', 'salesChannel', 'productChannel'];
+    const divergentes = campos.filter((c) => JSON.stringify(a?.[c]) !== JSON.stringify(b?.[c]));
+    if (a && b && divergentes.length === 0 && a.couponCode === null && b.couponCode === 'VOLTA10') {
+      ok('com cupom, pagamento/endereço/motoboy/histórico de status/cancelamento chegam idênticos ao pedido sem cupom; só couponCode muda.');
+    } else {
+      falhar(`regressão com cupom: divergentes=${JSON.stringify(divergentes)} a.couponCode=${JSON.stringify(a?.couponCode)} b.couponCode=${JSON.stringify(b?.couponCode)}`);
+    }
+    const esperado = {
+      payment: { methodLabel: 'Dinheiro', isPrepaid: false, needsChange: true, changeFor: 100, missingPayment: true },
+      address: { rua: 'Rua das Flores', numero: '120', complemento: 'Apto 3', bairro: 'Velha', referencia: 'Perto da praça', cidade: 'Blumenau' },
+      motoboy: { nome: 'Valmir Silva', telefone: '(47) 98888-0000', uuid: 'motoboy-uuid-1', custo: 7 },
+      status: ['Recebido', 'Produzindo', 'Enviado', 'Entregue'],
+    };
+    const conf = [
+      ['pagamento', JSON.stringify(b?.payment) === JSON.stringify(esperado.payment)],
+      ['endereço', JSON.stringify(b?.address) === JSON.stringify(esperado.address)],
+      ['motoboy', JSON.stringify(b?.motoboy) === JSON.stringify(esperado.motoboy)],
+      ['histórico de status', JSON.stringify((b?.statusHistory ?? []).map((s) => s.status)) === JSON.stringify(esperado.status)],
+    ].filter(([, passou]) => !passou).map(([n]) => n);
+    if (conf.length === 0) ok('pedido com cupom: pagamento, endereço, motoboy e histórico de status com os valores esperados.');
+    else falhar(`pedido com cupom com valores errados em: ${conf.join(', ')} -> ${JSON.stringify({ payment: b?.payment, address: b?.address, motoboy: b?.motoboy, statusHistory: b?.statusHistory })}`);
   }
 
   if (!falhou) {
