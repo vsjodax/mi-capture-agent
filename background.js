@@ -16,8 +16,8 @@ const STORAGE_KEYS = {
   // v1.7.0 — sinal de funcionamento (ver enviarSinal):
   agente: 'verys_mi_agente_id', // id aleatório desta instalação (não identifica pessoa)
   painel: 'verys_mi_painel', // { abas: {[tabId]: {vistoEm, paginaLogin}}, ultimaRespostaOkEm, ultimaFalhaSessaoEm, respostasOk: [{em, n}] }
-  observados: 'verys_mi_observados', // { [idPedidoMi]: vistoEm } — últimas 24 h, só o id
-  ultimoSinal: 'verys_mi_ultimo_sinal', // { em, ok, motivo }
+  observados: 'verys_mi_observados', // { [idPedidoMi]: { vistoEm, marca } } — últimas 24 h, só id e marca
+  ultimoSinal: 'verys_mi_ultimo_sinal', // { em, ok, motivo, situacao (resposta do VERYS) }
 };
 
 const ALARME_RETENTATIVA = 'verys_mi_retry_pendentes';
@@ -142,7 +142,7 @@ async function tentarEnviar(payload, config) {
 
     const corpoIndicaFalha = corpoJson && corpoJson.ok === false;
     if (resposta.ok && !corpoIndicaFalha) {
-      return { enviado: true };
+      return { enviado: true, corpo: corpoJson };
     }
 
     console.error('[VERYS Capture Agent] ingest-mi-order recusou ou sincronizou parcialmente o pedido:', resposta.status, corpoTexto);
@@ -261,20 +261,30 @@ async function registrarPresencaPainel(tabId, paginaLogin) {
   });
 }
 
-async function registrarObservado(idPedido) {
+// Marca do pedido como o VERYS a identifica (ingest-mi-order: merchant.name,
+// ex.: "hiperchefpizza") — só o identificador da marca, nunca dado de cliente.
+// Permite ao VERYS atribuir à loja um pedido visto que ainda não chegou lá.
+function marcaDoPayload(payload) {
+  const nome = payload?.merchant?.name;
+  return typeof nome === 'string' && nome.trim() ? nome : null;
+}
+
+async function registrarObservado(payload) {
+  const idPedido = payload?.id;
   if (typeof idPedido !== 'string' || !idPedido) return;
   await emSerie(async () => {
     const observados = await lerChave(STORAGE_KEYS.observados, {});
-    observados[idPedido] = new Date().toISOString();
+    observados[idPedido] = { vistoEm: new Date().toISOString(), marca: marcaDoPayload(payload) ?? observados[idPedido]?.marca ?? null };
     await chrome.storage.local.set({ [STORAGE_KEYS.observados]: podarObservados(observados, Date.now()) });
   });
 }
 
+// { [id]: { vistoEm, marca } } das últimas 24 h, mais recentes primeiro.
 function podarObservados(observados, agoraMs) {
   const limite = agoraMs - JANELA_OBSERVADOS_MS;
   const vivos = Object.entries(observados)
-    .filter(([, em]) => Date.parse(em) >= limite)
-    .sort((a, b) => (a[1] < b[1] ? 1 : -1))
+    .filter(([, o]) => o && typeof o.vistoEm === 'string' && Date.parse(o.vistoEm) >= limite)
+    .sort((a, b) => (a[1].vistoEm < b[1].vistoEm ? 1 : -1))
     .slice(0, MAX_OBSERVADOS);
   return Object.fromEntries(vivos);
 }
@@ -308,21 +318,29 @@ async function montarSinal(agoraMs) {
     fila: {
       pendentes: pend.length,
       maisAntigaEm: pend.reduce((min, p) => (!min || p.primeiraFalhaEm < min ? p.primeiraFalhaEm : min), null),
+      // Só id e marca de cada pedido esperando reenvio (para o VERYS saber
+      // de qual loja é) — nunca o pedido em si.
+      itens: Object.entries(pendentes).slice(0, MAX_OBSERVADOS).map(([id, p]) => ({ id, marca: marcaDoPayload(p.payload) })),
     },
     pedidos: {
-      ultimoVistoEm: Object.values(observados).reduce((max, em) => (!max || em > max ? em : max), null),
-      observados: Object.entries(observados).map(([id, vistoEm]) => ({ id, vistoEm })),
+      ultimoVistoEm: Object.values(observados).reduce((max, o) => (!max || o.vistoEm > max ? o.vistoEm : max), null),
+      observados: Object.entries(observados).map(([id, o]) => ({ id, vistoEm: o.vistoEm, marca: o.marca ?? null })),
     },
   };
 }
 
+// O VERYS responde ao sinal com a situação da captura que ELE conferiu
+// (painel, sessão, fila e pedidos registrados/atualizados, por loja). É isso
+// que o popup mostra como "sincronização comprovada" — nunca uma conclusão
+// tirada só do lado da extensão.
 async function enviarSinal() {
   const config = await getConfig();
   if (!config?.ingestUrl || !config?.token) return;
   const sinal = await montarSinal(Date.now());
   const resultado = await tentarEnviar(sinal, config);
+  const situacao = resultado.enviado && resultado.corpo && typeof resultado.corpo.situacao === 'object' ? resultado.corpo.situacao : null;
   await chrome.storage.local.set({
-    [STORAGE_KEYS.ultimoSinal]: { em: new Date().toISOString(), ok: resultado.enviado, motivo: resultado.motivo ?? null },
+    [STORAGE_KEYS.ultimoSinal]: { em: new Date().toISOString(), ok: resultado.enviado, motivo: resultado.motivo ?? null, situacao },
   });
 }
 
@@ -344,7 +362,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'pedido_observado') {
-    registrarObservado(message.payload?.id)
+    registrarObservado(message.payload)
       .then(() => enviarParaIngest(message.payload))
       .then(() => sendResponse({ ok: true }));
     return true; // resposta assíncrona

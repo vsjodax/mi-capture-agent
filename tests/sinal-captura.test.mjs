@@ -108,25 +108,28 @@ async function testarBackground() {
   verificar('painel: 1 aba aberta, fora do login, última resposta e 3 respostas em 30 min',
     s1?.corpo.painel.abasAbertas === 1 && s1.corpo.painel.paginaLogin === false
     && s1.corpo.painel.ultimaRespostaOkEm === okEm && s1.corpo.painel.respostasOk30min === 3, s1?.corpo.painel);
-  verificar('fila de reenvio vazia', s1?.corpo.fila.pendentes === 0 && s1.corpo.fila.maisAntigaEm === null, s1?.corpo.fila);
-  verificar('pedido visto aparece só pelo id', s1?.corpo.pedidos.observados.length === 1
-    && s1.corpo.pedidos.observados[0].id === 'pedido-a' && typeof s1.corpo.pedidos.ultimoVistoEm === 'string', s1?.corpo.pedidos);
+  verificar('fila de reenvio vazia', s1?.corpo.fila.pendentes === 0 && s1.corpo.fila.maisAntigaEm === null && s1.corpo.fila.itens.length === 0, s1?.corpo.fila);
+  verificar('pedido visto aparece só por id, horário e marca', s1?.corpo.pedidos.observados.length === 1
+    && JSON.stringify(Object.keys(s1.corpo.pedidos.observados[0]).sort()) === JSON.stringify(['id', 'marca', 'vistoEm'])
+    && s1.corpo.pedidos.observados[0].id === 'pedido-a' && s1.corpo.pedidos.observados[0].marca === null && typeof s1.corpo.pedidos.ultimoVistoEm === 'string', s1?.corpo.pedidos);
   verificar('nenhum dado de cliente no sinal', !JSON.stringify(s1?.corpo).includes('Fulano'));
-  verificar('resultado do sinal guardado para o popup', bg.dados.verys_mi_ultimo_sinal?.ok === true);
+  verificar('resultado do sinal guardado para o popup (sem situação do VERYS na resposta = null)', bg.dados.verys_mi_ultimo_sinal?.ok === true && bg.dados.verys_mi_ultimo_sinal.situacao === null);
 
   // O mesmo agente é mantido entre sinais.
   const agente = s1.corpo.agenteId;
 
   // Pedido recusado (422) fica na fila de reenvio e aparece no sinal.
   bg.respostas.push({ status: 422, corpo: { ok: false, avisos: ['x'] } });
-  await bg.mensagem({ type: 'pedido_observado', payload: { id: 'pedido-b' } }, 7);
+  await bg.mensagem({ type: 'pedido_observado', payload: { id: 'pedido-b', merchant: { id: 'hiperchefpizza', name: 'hiperchefpizza' }, customer: { name: 'Ciclano' } } }, 7);
   await esperarMicrotasks();
   await bg.alarme('verys_mi_sinal');
   const s2 = bg.chamadasFetch.at(-1);
   verificar('pedido recusado entra na fila de reenvio do sinal',
     s2?.corpo.fila.pendentes === 1 && typeof s2.corpo.fila.maisAntigaEm === 'string', s2?.corpo.fila);
-  verificar('pedido recusado também consta como visto (para a conferência)',
-    s2?.corpo.pedidos.observados.some((o) => o.id === 'pedido-b'));
+  verificar('pedido recusado também consta como visto, com a marca (para a conferência por loja)',
+    s2?.corpo.pedidos.observados.some((o) => o.id === 'pedido-b' && o.marca === 'hiperchefpizza'));
+  verificar('fila de reenvio leva id e marca de cada pedido, sem dado de cliente',
+    JSON.stringify(s2?.corpo.fila.itens) === JSON.stringify([{ id: 'pedido-b', marca: 'hiperchefpizza' }]) && !JSON.stringify(s2?.corpo).includes('Ciclano'), s2?.corpo.fila);
   verificar('mesmo agente entre sinais', s2?.corpo.agenteId === agente);
 
   // Tela de login e sessão caída.
@@ -145,7 +148,7 @@ async function testarBackground() {
   verificar('aba sem presença há 4 min não conta como aberta', bg.chamadasFetch.at(-1)?.corpo.painel.abasAbertas === 0);
 
   // Pedido visto há mais de 24 h sai da lista.
-  bg.dados.verys_mi_observados['pedido-velho'] = new Date(Date.now() - 25 * 3600000).toISOString();
+  bg.dados.verys_mi_observados['pedido-velho'] = { vistoEm: new Date(Date.now() - 25 * 3600000).toISOString(), marca: null };
   await bg.alarme('verys_mi_sinal');
   verificar('pedido visto há mais de 24 h não é enviado',
     !bg.chamadasFetch.at(-1)?.corpo.pedidos.observados.some((o) => o.id === 'pedido-velho'));
@@ -156,6 +159,12 @@ async function testarBackground() {
   await esperarMicrotasks();
   const vistos = Object.keys(bg.dados.verys_mi_observados).filter((k) => k.startsWith('simultaneo-'));
   verificar('5 pedidos vistos ao mesmo tempo ficam todos registrados', vistos.length === 5, vistos);
+
+  // Situação conferida pelo VERYS fica guardada para o popup.
+  const situacaoVerys = { comprovada: false, verificadoEm: new Date().toISOString(), lojas: [{ loja: 'Pizza', motivo: 'pedidos_atualizacao_pendente' }, { loja: 'Burger', motivo: null }] };
+  bg.respostas.push({ status: 200, corpo: { ok: true, situacao: situacaoVerys } });
+  await bg.alarme('verys_mi_sinal');
+  verificar('situação devolvida pelo VERYS fica guardada para o popup', JSON.stringify(bg.dados.verys_mi_ultimo_sinal?.situacao) === JSON.stringify(situacaoVerys));
 
   // Falha de rede no sinal fica registrada para o popup.
   const fetchAntes = bg.chamadasFetch.length;
@@ -267,8 +276,31 @@ async function testarPageHook() {
   verificar('pedido continua sendo emitido como antes', pedidos.length === 1 && pedidos[0].payload.id === 'uuid-sintetico-1', pedidos);
 }
 
+// ---------------------------------------------------------------- popup
+function testarPopup() {
+  const POPUP = fs.readFileSync(join(AQUI, '..', 'popup.js'), 'utf-8');
+  const ctx = { Date, JSON, Array, Object, String };
+  vm.createContext(ctx);
+  vm.runInContext(POPUP + '\nthis.descreverSincronizacao = descreverSincronizacao;', ctx, { filename: 'popup.js' });
+  const agora = Date.parse('2026-11-20T18:00:00.000Z');
+  const em = (min) => new Date(agora - min * 60000).toISOString();
+  const d = (s) => ctx.descreverSincronizacao(s, agora);
+  verificar('popup: sem sinal enviado = NÃO comprovada', d(null).comprovada === false && /NÃO comprovada/.test(d(null).titulo));
+  verificar('popup: sinal recusado = NÃO comprovada, com o motivo', d({ em: em(1), ok: false, motivo: 'http_401' }).comprovada === false
+    && d({ em: em(1), ok: false, motivo: 'http_401' }).detalhes[0].includes('http_401'));
+  verificar('popup: sinal antigo (> 5 min) = NÃO comprovada, mesmo se o VERYS tinha comprovado',
+    d({ em: em(6), ok: true, situacao: { comprovada: true, lojas: [] } }).comprovada === false);
+  verificar('popup: resposta sem situação (servidor antigo) = NÃO comprovada', d({ em: em(1), ok: true, situacao: null }).comprovada === false);
+  const pend = d({ em: em(1), ok: true, situacao: { comprovada: false, lojas: [{ loja: 'HiperChef Pizza Premium', motivo: 'pedidos_atualizacao_pendente' }, { loja: 'HiperChef Burger Premium', motivo: null }] } });
+  verificar('popup: motivo por loja aparece por extenso, só nas lojas com problema', pend.comprovada === false && pend.detalhes.length === 1
+    && pend.detalhes[0] === 'HiperChef Pizza Premium: há pedido com atualização ainda não sincronizada', pend.detalhes);
+  const ok = d({ em: em(1), ok: true, situacao: { comprovada: true, lojas: [{ loja: 'Pizza', motivo: null }] } });
+  verificar('popup: só diz comprovada quando o VERYS comprovou num sinal recente', ok.comprovada === true && /comprovada pelo VERYS/.test(ok.titulo));
+}
+
 await testarBackground();
 await testarPageHook();
+testarPopup();
 if (falhou) {
   console.log('\n=== TESTE FALHOU ===');
   process.exitCode = 1;
