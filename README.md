@@ -130,6 +130,26 @@ nesse caso, abra o Console do DevTools na aba do Menu Integrado, procure
 por respostas de rede que contenham `uuid`/`customer_phone`, e ajuste a
 função `pareceUmPedido` conforme o formato real observado.
 
+## Sinal de funcionamento (v1.7.0)
+
+A cada 2 minutos a extensão envia ao mesmo endpoint um corpo
+`{ "tipo": "sinal_captura", ... }`, **sem nenhum dado de cliente**:
+
+- se há aba do painel do MI aberta (presença informada a cada 1 min) e se
+  ela está na tela de login;
+- horário da última resposta do painel com sessão válida (2xx de
+  `*.menuintegrado.com.br`) e da última falha de sessão (401/403 ou
+  redirecionamento para o login), com a contagem de respostas em 30 min;
+- a fila de reenvio (quantos pedidos ainda sem confirmação e desde quando);
+- os ids dos pedidos vistos nas últimas 24 h (só o id), para o VERYS
+  conferir que cada um foi registrado.
+
+Tudo vem do tráfego que o painel já faz: a extensão continua sem disparar
+nenhuma requisição ao MI. No VERYS, a jornada do CRM só envia mensagens
+quando esse sinal mostra a captura confiável; sem pedido novo (antes da
+abertura, por exemplo) **não** é falha. O popup mostra o estado do painel
+e o resultado do último sinal.
+
 ## Estrutura
 
 - `manifest.json` — permissões mínimas; domínio fixo em
