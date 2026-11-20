@@ -13,6 +13,10 @@
     .card .valor { font-size: 1.3rem; font-weight: 700; margin-top: 2px; }
     .rodape { margin-top: 12px; font-size: 0.7rem; color: #666; }
     a { color: #1a5fb4; }
+    .sinc { margin-top: 12px; border-radius: 8px; padding: 8px 10px; font-size: 0.75rem; }
+    .sinc ul { margin: 4px 0 0 0; padding-left: 16px; }
+    .sinc.ok { background: #e7f6ec; color: #135c2b; border: 1px solid #9fd6b1; }
+    .sinc.nao { background: #fdecec; color: #8a1c1c; border: 1px solid #f0a8a8; }
   </style>
 </head>
 <body>
@@ -24,6 +28,11 @@
     <div class="card"><div class="label">Pendentes</div><div class="valor" id="pendentes">—</div></div>
   </div>
   <div class="rodape">Último envio: <span id="ultimoEnvio">—</span></div>
+  <div class="rodape">Painel do MI: <span id="painelMi">—</span></div>
+  <div id="sincronizacao" class="sinc nao">
+    <strong id="sincTitulo">Sincronização NÃO comprovada</strong>
+    <ul id="sincDetalhes"><li>aguardando o VERYS</li></ul>
+  </div>
   <div class="rodape"><a href="options.html" target="_blank">Configurar</a></div>
   <script src="popup.js"></script>
 </body>

@@ -413,12 +413,86 @@
     }
   }
 
+  // --- Sinal do painel (v1.7.0) ---
+  // Prova que o painel do MI está aberto e com sessão válida mesmo sem pedido
+  // novo (antes da abertura da loja não há pedido, e isso não é falha). Usa só
+  // as respostas que o próprio painel já recebe: nunca dispara requisição.
+  //   * resposta 2xx de *.menuintegrado.com.br que não caiu em tela de login
+  //     = sessão válida naquele instante;
+  //   * 401/403, ou resposta que terminou numa URL de login = sessão inválida.
+  // Nada do conteúdo da resposta é enviado, só horários e uma contagem.
+  const PADRAO_URL_LOGIN = /\/(login|signin|sign-in|entrar|auth)(\/|$|\?)/i;
+  const INTERVALO_MIN_SINAL_MS = 30000;
+  const estadoPainel = { ultimaRespostaOkEm: null, ultimaFalhaSessaoEm: null, respostasOk: 0 };
+  let ultimoEnvioSinalEm = 0;
+  let sinalAgendado = false;
+
+  function ehDoMenuIntegrado(url) {
+    try {
+      const base = typeof location !== 'undefined' ? location.href : 'https://painel.menuintegrado.com.br/';
+      const host = new URL(url, base).hostname;
+      return host === 'menuintegrado.com.br' || host.endsWith('.menuintegrado.com.br');
+    } catch {
+      return false;
+    }
+  }
+
+  function emitirSinalPainel() {
+    sinalAgendado = false;
+    ultimoEnvioSinalEm = Date.now();
+    const estado = { ...estadoPainel };
+    estadoPainel.respostasOk = 0;
+    window.postMessage({ channel: CHANNEL, tipo: 'sinal_painel', estado }, '*');
+  }
+
+  function agendarSinalPainel(imediato) {
+    const espera = INTERVALO_MIN_SINAL_MS - (Date.now() - ultimoEnvioSinalEm);
+    if (imediato || espera <= 0) {
+      emitirSinalPainel();
+      return;
+    }
+    if (!sinalAgendado && typeof setTimeout === 'function') {
+      sinalAgendado = true;
+      setTimeout(emitirSinalPainel, espera);
+    }
+  }
+
+  // urlFinal só é passada quando a resposta veio de um redirecionamento (a
+  // própria URL pedida nunca conta como "login": uma chamada a /auth/refresh
+  // que responde 200 é sessão válida).
+  function classificarResposta(url, status, urlFinal) {
+    if (!ehDoMenuIntegrado(url)) return null;
+    if (status === 401 || status === 403) return 'falha_sessao';
+    if (urlFinal && ehDoMenuIntegrado(urlFinal) && PADRAO_URL_LOGIN.test(new URL(urlFinal, 'https://x/').pathname + '/')) return 'falha_sessao';
+    if (status >= 200 && status <= 299) return 'ok';
+    return null; // 5xx, 404 etc. não dizem nada sobre a sessão
+  }
+
+  function registrarRespostaPainel(url, status, urlFinal) {
+    try {
+      const tipo = classificarResposta(url, status, urlFinal);
+      if (!tipo) return;
+      const agora = new Date().toISOString();
+      if (tipo === 'ok') {
+        estadoPainel.ultimaRespostaOkEm = agora;
+        estadoPainel.respostasOk += 1;
+        agendarSinalPainel(false);
+      } else {
+        estadoPainel.ultimaFalhaSessaoEm = agora;
+        agendarSinalPainel(true);
+      }
+    } catch {
+      // Nunca deixa o sinal interferir na chamada real do Menu Integrado.
+    }
+  }
+
   // --- fetch ---
   const fetchOriginal = window.fetch;
   window.fetch = async function (...args) {
     const resposta = await fetchOriginal.apply(this, args);
     try {
       const url = (args[0] && args[0].url) || String(args[0] || '');
+      registrarRespostaPainel(url, resposta.status, resposta.redirected ? resposta.url : null);
       resposta
         .clone()
         .text()
@@ -441,6 +515,17 @@
 
   XMLHttpRequest.prototype.send = function (...args) {
     this.addEventListener('load', () => {
+      try {
+        const pedida = this._verysUrl || '';
+        let redirecionadaPara = null;
+        if (this.responseURL) {
+          const base = typeof location !== 'undefined' ? location.href : 'https://painel.menuintegrado.com.br/';
+          if (new URL(pedida, base).href !== this.responseURL) redirecionadaPara = this.responseURL;
+        }
+        registrarRespostaPainel(pedida, this.status, redirecionadaPara);
+      } catch {
+        // Idem.
+      }
       try {
         if (typeof this.responseText === 'string') tentarExtrairEEmitir(this._verysUrl || '', this.responseText);
       } catch {
