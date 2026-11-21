@@ -345,13 +345,17 @@
   //     quando existe — é a fonte exata;
   //   * demais etapas: dias candidatos com aquele HH:mm dentro da janela
   //     [criação − 30 min, entrega] (ou [criação − 30 min, agora] se ainda não
-  //     entregue). Um candidato só = essa data. Nenhum na janela, mas um nas
-  //     24 h antes da criação = etapa anterior à criação (aceita). Mais de um
+  //     entregue). Um candidato só = essa data. Nenhum (etapa mais de 30 min
+  //     antes da criação ou depois da entrega) ou mais de um
   //     (agendado / mais de um dia) = AMBÍGUO: a etapa fica de fora;
   //   * "Entrega prevista" (estimativa): janela [criação − 30 min, criação +
   //     23 h 30]; fora disso, fica de fora.
   // Datas completas no HTML ("DD/MM HH:mm", "DD/MM/AAAA HH:mm") valem direto.
+  // v1.8.3: sem exceção além dos 30 min (a 1.8.2 aceitava uma data única nas
+  // 24 h antes da criação — com o relógio da loja alguns minutos atrás do MI,
+  // isso devolvia uma etapa de 00:10 para o dia anterior, o mesmo defeito).
   const TOLERANCIA_ANTES_MS = 30 * 60 * 1000;
+  const FOLGA_RELOGIO_MS = 10 * 60 * 1000;
   const DIA_MS = 24 * 60 * 60 * 1000;
 
   function candidatosNaJanela(base, hora, minuto, de, ate) {
@@ -373,6 +377,10 @@
     const diaCorrente = new Date(dataAncora.getFullYear(), dataAncora.getMonth(), dataAncora.getDate());
     const criacao = dataAncora.getTime();
     const fim = entregueEm ? entregueEm.getTime() : agora.getTime();
+    // Folga no fim da janela: 1 min sobre a entrega (horário do próprio MI);
+    // 10 min sobre "agora" (relógio do computador da loja pode estar atrás do
+    // MI). Minutos, nunca um dia: não cria uma segunda data possível.
+    const folgaFim = entregueEm ? 60 * 1000 : FOLGA_RELOGIO_MS;
 
     while ((match = linhaRegex.exec(html)) !== null) {
       const rotulo = match[1].trim();
@@ -398,15 +406,14 @@
         // uma data só, mesmo em pedido agendado para outro dia.
         dataEvento = candidatosNaJanela(diaCorrente, parsed.hora, parsed.minuto, criacao - TOLERANCIA_ANTES_MS, criacao + TOLERANCIA_ANTES_MS)[0];
       } else if (ehEventoSequencial) {
-        const naJanela = candidatosNaJanela(diaCorrente, parsed.hora, parsed.minuto, criacao - TOLERANCIA_ANTES_MS, fim + 60 * 1000);
+        const naJanela = candidatosNaJanela(diaCorrente, parsed.hora, parsed.minuto, criacao - TOLERANCIA_ANTES_MS, fim + folgaFim);
         if (naJanela.length === 1) {
           dataEvento = naJanela[0];
-        } else if (naJanela.length === 0) {
-          const antes = candidatosNaJanela(diaCorrente, parsed.hora, parsed.minuto, criacao - DIA_MS, criacao - TOLERANCIA_ANTES_MS - 1);
-          if (antes.length !== 1) { ambiguos += 1; continue; }
-          dataEvento = antes[0]; // etapa anterior à criação (ex.: aceite antes do registro)
         } else {
-          ambiguos += 1; // agendado / mais de um dia: não inventa
+          // Nenhuma data na janela (etapa > 30 min antes da criação, ou depois
+          // da entrega/agora) ou mais de uma (agendado, mais de um dia): fica
+          // de fora — nunca inventa.
+          ambiguos += 1;
           continue;
         }
       } else {

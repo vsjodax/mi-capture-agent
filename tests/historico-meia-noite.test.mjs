@@ -54,9 +54,17 @@ const r3 = await capturar({ criado: '2026-11-20 10:00', entregue: '2026-11-21 20
 verificar('agendado: Recebido no dia da criação e Entregue pelo horário completo do MI', r3.h.Recebido === '20/11 10:00' && r3.h.Entregue === '21/11 20:15', r3);
 verificar('agendado: Produzindo/Enviado (dois dias possíveis) ficam de fora, sem data inventada', !('Produzindo' in r3.h) && !('Enviado' in r3.h) && r3.amb >= 2, r3);
 
-// 4) Etapa ANTERIOR à criação (aceite 40 min antes do registro).
-const r4 = await capturar({ criado: '2026-11-20 19:30', entregue: '2026-11-20 20:20', agora: '2026-11-20 21:00', linhas: [['Recebido', '18:50'], ['Produzindo', '19:35'], ['Entregue', '20:20']] });
-verificar('etapa anterior à criação fica no mesmo dia (20/11 18:50), não no dia seguinte', r4.h.Recebido === '20/11 18:50' && r4.h.Produzindo === '20/11 19:35' && r4.amb === 0, r4);
+// 4) Etapas ANTERIORES à criação: até 30 min = aceitas; mais que isso = fora.
+const r4a = await capturar({ criado: '2026-11-20 19:30', entregue: '2026-11-20 20:20', agora: '2026-11-20 21:00', linhas: [['Recebido', '19:05'], ['Produzindo', '19:35'], ['Entregue', '20:20']] });
+verificar('etapa 25 min antes da criação: aceita no mesmo dia (20/11 19:05)', r4a.h.Recebido === '20/11 19:05' && r4a.h.Produzindo === '20/11 19:35' && r4a.amb === 0, r4a);
+const r4b = await capturar({ criado: '2026-11-20 19:30', entregue: '2026-11-20 20:20', agora: '2026-11-20 21:00', linhas: [['Recebido', '18:50'], ['Produzindo', '19:35'], ['Entregue', '20:20']] });
+verificar('etapa 40 min antes da criação: fica de fora (não vira 20/11 nem 21/11)', !('Recebido' in r4b.h) && r4b.h.Produzindo === '20/11 19:35' && r4b.amb === 1, r4b);
+
+// 4c) Relógio da loja 5 min ATRÁS do MI, atravessando a meia-noite (em andamento).
+const r4c = await capturar({ criado: '2026-11-20 23:58', agora: '2026-11-21 00:05', linhas: [['Recebido', '23:58'], ['Enviado', '00:10']] });
+verificar('relógio da loja atrás do MI: Enviado 00:10 vai para 21/11, nunca 20/11', r4c.h.Enviado === '21/11 00:10' && r4c.h.Recebido === '20/11 23:58', r4c);
+const r4d = await capturar({ criado: '2026-11-20 23:58', agora: '2026-11-21 00:05', linhas: [['Enviado', '00:30']] });
+verificar('etapa 25 min no futuro do relógio local (além da folga de 10 min): fica de fora', !('Enviado' in r4d.h) && r4d.amb === 1, r4d);
 
 // 5) Entrega MAIS DE UM DIA depois (não agendado): criado 20/11 19:00, entregue 21/11 21:00.
 const r5 = await capturar({ criado: '2026-11-20 19:00', entregue: '2026-11-21 21:00', agora: '2026-11-21 22:00', linhas: [['Recebido', '19:00'], ['Produzindo', '19:05'], ['Entregue', '21:00']] });
