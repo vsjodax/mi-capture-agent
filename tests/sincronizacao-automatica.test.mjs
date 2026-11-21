@@ -152,6 +152,41 @@ function criarPageHook() {
   verificar('mudança de status muda a assinatura', resumo2.itens[0].assinatura !== resumo.itens[0].assinatura && resumo2.itens[1].assinatura === resumo.itens[1].assinatura);
 }
 
+// ---------------------------------------------- formato REAL do MI (diagnóstico 21/11/2026), conta fictícia
+{
+  const ph = criarPageHook();
+  const BASE = 'https://painel.menuintegrado.com.br/panel/franchises/contaficticia';
+  // Lista real: orders/to_dispatch (formato do diagnóstico, valores sintéticos)
+  const toDispatch = [{ latitude: -26.9, longitude: -48.6, status: 'dispatched', uuid: UUID, code: '905032', position: 1, maxForecast: '20:10', userName: 'Fulano de Tal', userMobilePhone: '47999998888',
+    address: 'Rua das Flores, 10', dispatched: true, restaurantName: 'Pizza', restaurantSlug: 'hiperchefpizza', deliveryClientName: null, phoneUrl: 'tel:47999998888',
+    payments: [{ uuid: '88888888-8888-4888-8888-888888888888', provider: 'delivery', method: 'pix', total: '57.00' }], items: [{ uuid: '99999999-9999-4999-8999-999999999999', productName: 'Pizza', quantity: '1' }], points: [], url: '/panel/orders/x' }];
+  ph.respostas.set(BASE + '/orders/to_dispatch', { status: 200, texto: JSON.stringify(toDispatch) });
+  await ph.painelPede(BASE + '/orders/to_dispatch', { method: 'GET' });
+  const lr = ph.postados.filter((m) => m.tipo === 'lista_pedidos').at(-1);
+  verificar('lista real to_dispatch: pedido reconhecido com código e marca (restaurantSlug)', lr?.itens?.length === 1 && lr.itens[0].id === UUID && lr.itens[0].codigo === '905032' && lr.itens[0].marca === 'hiperchefpizza', lr);
+  verificar('lista real: pagamento e item (que têm uuid) NÃO viram candidato; nada de cliente', !JSON.stringify(lr).includes('88888888') && !JSON.stringify(lr).includes('99999999') && !SENSIVEIS.some((v) => JSON.stringify(lr).includes(v)));
+  const mp = ph.postados.find((m) => m.tipo === 'modelo_detalhe')?.modelo;
+  verificar('modelo PADRÃO montado da conta do painel, sem abrir pedido', mp?.url === BASE + '/orders/{id}.json' && mp.padrao === true && mp.campo === 'uuid', mp);
+  // Consulta sem nenhum detalhe aberto
+  ph.respostas.set(BASE + '/orders/' + UUID2 + '.json', { status: 200, texto: detalheHtml(UUID2) });
+  ph.chamadas.length = 0;
+  await ph.extensaoPede([{ id: UUID2 }]);
+  verificar('consulta sai no endereço real <uuid>.json sem ninguém abrir pedido', ph.chamadas.length === 1 && ph.chamadas[0].url === BASE + '/orders/' + UUID2 + '.json' && ph.chamadas[0].opcoes.method === 'GET');
+  verificar('pedido consultado chega completo', ph.postados.some((m) => m.payload?.id === UUID2 && m.payload._origemCaptura === 'consulta'));
+
+  // Detalhe real aberto: aprende o modelo com ".json"; diagnóstico mascarado
+  const ph2 = criarPageHook();
+  ph2.respostas.set(BASE + '/orders/' + UUID + '.json', { status: 200, texto: detalheHtml(UUID) });
+  await ph2.painelPede(BASE + '/orders/' + UUID + '.json', { method: 'GET' });
+  ph2.respostas.set(BASE + '/orders/' + UUID2 + '.json', { status: 200, texto: detalheHtml(UUID2) });
+  ph2.chamadas.length = 0;
+  await ph2.extensaoPede([{ id: UUID2 }]);
+  verificar('detalhe real <uuid>.json ensina o modelo (id dentro do segmento)', ph2.chamadas[0]?.url === BASE + '/orders/' + UUID2 + '.json', ph2.chamadas.map((c) => c.url));
+  ph2.rodarTimers();
+  const rotas = ph2.postados.filter((m) => m.tipo === 'sinal_painel').at(-1)?.estado?.rotas ?? [];
+  verificar('diagnóstico mascara o uuid dentro do segmento (orders/:id.json)', rotas.some((r) => r.rota === '/panel/franchises/contaficticia/orders/:id.json') && !JSON.stringify(rotas).includes(UUID) && !JSON.stringify(rotas).includes(UUID2), rotas.map((r) => r.rota));
+}
+
 // ---------------------------------------------- lista por HTML simples e WebSocket
 {
   const ph = criarPageHook();
@@ -184,9 +219,21 @@ function criarPageHook() {
   await ph.wsRecebe(ws, JSON.stringify({ event: 'order.html', data: JSON.stringify({ html: frag }) }));
   const lw2 = ph.postados.filter((m) => m.tipo === 'lista_pedidos').at(-1);
   verificar('WebSocket: HTML dentro da mensagem também é lido', lw2?.itens?.length === 2 && lw2.itens[0].incerto === true);
+  // ActionCable do MI (www.menuintegrado.com.br/cable)
+  const cable = ph.novoWs('wss://www.menuintegrado.com.br/cable');
+  await ph.wsRecebe(cable, JSON.stringify({ type: 'ping', message: 1795230000 }));
+  const antesCable = ph.postados.filter((m) => m.tipo === 'lista_pedidos').length;
+  await ph.wsRecebe(cable, JSON.stringify({ identifier: JSON.stringify({ channel: 'OrdersChannel', franchise: 'contaficticia' }), message: { action: 'updated', order_uuid: UUID, customer_uuid: '11111111-1111-4111-8111-111111111111' } }));
+  const lc = ph.postados.filter((m) => m.tipo === 'lista_pedidos').at(-1);
+  verificar('ActionCable do MI: aviso com order_uuid vira candidato; customer_uuid não', ph.postados.filter((m) => m.tipo === 'lista_pedidos').length === antesCable + 1 && lc.itens.length === 1 && lc.itens[0].id === UUID && lc.itens[0].incerto === true, lc);
+  const outroWs = ph.novoWs('wss://ws.outro.com/socket');
+  const antesOutro = ph.postados.filter((m) => m.tipo === 'lista_pedidos').length;
+  await ph.wsRecebe(outroWs, JSON.stringify({ message: { order_uuid: UUID2 } }));
+  verificar('aviso só com order_uuid vindo de WebSocket de outro domínio é ignorado', ph.postados.filter((m) => m.tipo === 'lista_pedidos').length === antesOutro);
   ph.rodarTimers();
   const rotasWs = ph.postados.filter((m) => m.tipo === 'sinal_painel').at(-1)?.estado?.rotas ?? [];
   const rw = rotasWs.find((r) => r.rota.startsWith('ws:ws-sa1.pusher.com/app/:id'));
+  verificar('ActionCable: diagnóstico leva o nome do canal, sem o restante do identifier', rotasWs.some((r) => r.rota === 'ws:www.menuintegrado.com.br/cable#OrdersChannel') && !JSON.stringify(rotasWs).includes('contaficticia'), rotasWs.map((r) => r.rota));
   verificar('WebSocket: estrutura entra no diagnóstico com o evento, sem chave/valores', rw && rw.rota.includes('#order.updated') && rw.forma.includes('order:{uuid:str,code:str,status:str,customer:{name:str}}')
     && !JSON.stringify(rotasWs).includes('chave123') && !SENSIVEIS.some((v) => JSON.stringify(rotasWs).includes(v)), rotasWs.map((r) => r.rota));
 }
@@ -263,6 +310,14 @@ function criarBackground(agoraInicial) {
   bg.abasMsgs.length = 0; await bg.rodada();
   verificar('no máximo 6 consultas por rodada', bg.abasMsgs.length === 1 && bg.abasMsgs[0].msg.pedidos.length === 6, bg.abasMsgs[0]?.msg.pedidos.length);
 
+  // Limite global: rodadas extras no mesmo minuto não passam de 6 no total.
+  await bg.rodada(); await bg.rodada(); await bg.rodada();
+  const noMinuto = bg.abasMsgs.reduce((s, x) => s + x.msg.pedidos.length, 0);
+  verificar('limite global: 4 rodadas no mesmo minuto = no máximo 6 consultas', noMinuto === 6, noMinuto);
+  bg.avancar(1.01); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7);
+  bg.abasMsgs.length = 0; await bg.rodada();
+  verificar('limite global: no minuto seguinte libera de novo (até 6)', bg.abasMsgs.reduce((s, x) => s + x.msg.pedidos.length, 0) === 6);
+
   // Sessão inválida → pausa 10 min.
   await bg.msg({ type: 'detalhe_resultado', id: 'pedido-novo-0000', status: 401, reconhecido: false, motivo: 'http_401' });
   bg.abasMsgs.length = 0; bg.avancar(2); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
@@ -276,6 +331,9 @@ function criarBackground(agoraInicial) {
   await bg.rodada();
   verificar('aba no login: nenhuma consulta', bg.abasMsgs.length === 0);
 
+  // Modelo padrão não substitui modelo aprendido de detalhe real.
+  await bg.msg({ type: 'modelo_detalhe', modelo: { url: 'https://painel.menuintegrado.com.br/panel/franchises/x/orders/{id}.json', campo: 'uuid', padrao: true } });
+  verificar('modelo padrão não substitui o aprendido de detalhe real', bg.dados.verys_mi_sync.modelo.url === 'https://api.menuintegrado.com.br/orders/{id}/details');
   // Id incerto (achado em HTML/push) que não é pedido: 1 consulta e descarta.
   for (const it of muitos) await bg.msg({ type: 'pedido_observado', payload: { id: it.id, createdAt: it.criadoEm, merchant: { name: 'x' }, customer: {}, statusHistory: [{ status: 'Entregue' }] } });
   bg.avancar(1);

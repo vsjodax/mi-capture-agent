@@ -458,7 +458,9 @@
   // + ao menos 2 marcas de pedido (as mesmas chaves do pedido real, ver
   // _debugMotoboy.todasAsChaves). Cliente, motoboy, item ou produto (que
   // também têm uuid) não passam — nunca viram consulta.
-  const MARCAS_DE_PEDIDO = ['rootResource', 'channel', 'createdAt', 'customer', 'subtotal', 'total', 'items', 'statusMessage', 'deliveryMethod', 'productChannel', 'cancelled'];
+  // payments/items/restaurantSlug/dispatched: lista real do painel
+  // (/panel/franchises/<conta>/orders/to_dispatch, diagnóstico de 21/11/2026).
+  const MARCAS_DE_PEDIDO = ['rootResource', 'channel', 'createdAt', 'customer', 'subtotal', 'total', 'items', 'statusMessage', 'deliveryMethod', 'productChannel', 'cancelled', 'payments', 'restaurantSlug', 'dispatched'];
 
   function resumoDaLista(item) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
@@ -470,7 +472,8 @@
     if (marcas < 2 && !statusComDono) return null;
     const assinatura = hashTexto(JSON.stringify(chaves.map((k) => [k, item[k]])));
     const codigo = typeof item.code === 'string' || typeof item.code === 'number' ? String(item.code).slice(0, 32) : null;
-    const marca = typeof item.rootResource?.slug === 'string' ? item.rootResource.slug.slice(0, 120) : null;
+    const slug = typeof item.rootResource?.slug === 'string' ? item.rootResource.slug : (typeof item.restaurantSlug === 'string' ? item.restaurantSlug : null);
+    const marca = slug ? slug.slice(0, 120) : null;
     return { id: item.uuid, codigo, marca, assinatura, criadoEm: typeof item.createdAt === 'string' ? item.createdAt.slice(0, 40) : null };
   }
 
@@ -513,7 +516,7 @@
   // (data-order-id, data-order-uuid…) cujo valor é só o UUID, ou link/rota
   // .../orders/<uuid> ou .../pedidos/<uuid>. UUID de cliente, produto, loja,
   // imagem ou qualquer outro atributo é ignorado — nunca vira consulta.
-  const ROTA_DE_PEDIDO = /\/(orders?|pedidos?)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=$|[/?#])/i;
+  const ROTA_DE_PEDIDO = /\/(orders?|pedidos?)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=$|[/?#.])/i;
   const NOME_DE_PEDIDO = /^data-(order|pedido)[\w-]*$/i;
 
   function idDePedidoNoAtributo(nome, valor) {
@@ -620,10 +623,13 @@
       for (const [campo, valor] of candidatos) {
         const v = String(valor);
         const segmentos = u.pathname.split('/');
-        const noCaminho = segmentos.includes(v);
+        // O id pode ser o segmento inteiro ou parte dele — a rota real do MI
+        // (21/11/2026) é /panel/franchises/<conta>/orders/<uuid>.json.
+        const comId = (seg) => seg === v || (seg.startsWith(v) && /^[.][A-Za-z0-9]{1,8}$/.test(seg.slice(v.length)));
+        const noCaminho = segmentos.some(comId);
         const paramsComId = [...u.searchParams.entries()].filter(([, pv]) => pv === v).map(([pk]) => pk);
         if (!noCaminho && paramsComId.length === 0) continue;
-        const caminho = segmentos.map((s) => (s === v ? '{id}' : s)).join('/');
+        const caminho = segmentos.map((s) => (comId(s) ? `{id}${s.slice(v.length)}` : s)).join('/');
         const params = [...u.searchParams.entries()].map(([pk, pv]) => [pk, pv === v ? '{id}' : pv]);
         const consulta = params.map(([pk, pv]) => `${encodeURIComponent(pk)}=${pv === '{id}' ? '{id}' : encodeURIComponent(pv)}`).join('&');
         modeloDetalhe = { url: `${u.origin}${caminho}${consulta ? `?${consulta}` : ''}`, campo };
@@ -744,9 +750,33 @@
   function mascararRota(url) {
     const base = typeof location !== 'undefined' ? location.href : 'https://painel.menuintegrado.com.br/';
     const u = new URL(url, base);
-    const caminho = u.pathname.split('/').map((s) => (SEGMENTO_ID.test(s) ? ':id' : s)).join('/');
+    const caminho = u.pathname.split('/').map((s) => (SEGMENTO_ID.test(s) ? ':id' : s.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, ':id'))).join('/');
     const params = [...new Set([...u.searchParams.keys()])].filter((k) => /^[\w.-]{1,40}$/.test(k)).sort().join('&');
     return (caminho + (params ? `?${params}` : '')).slice(0, 200);
+  }
+
+  // Modelo PADRÃO do detalhe (v1.8.1), sem precisar abrir pedido: toda
+  // requisição do painel passa por /panel/franchises/<conta>/…, e o detalhe
+  // real é <origem>/panel/franchises/<conta>/orders/<uuid>.json (confirmado
+  // no diagnóstico de 21/11/2026). Vale até um detalhe real ensinar o modelo;
+  // não tem token, então pode ser guardado pela extensão.
+  let modeloPadraoEnviado = false;
+  function aprenderContaDoPainel(url) {
+    try {
+      if (modeloDetalhe) return;
+      const base = typeof location !== 'undefined' ? location.href : 'https://painel.menuintegrado.com.br/';
+      const u = new URL(url, base);
+      if (!ehDoMenuIntegrado(u.href)) return;
+      const m = u.pathname.match(/^\/panel\/franchises\/([a-z0-9][a-z0-9_-]{1,60})\//i);
+      if (!m) return;
+      modeloDetalhe = { url: `${u.origin}/panel/franchises/${m[1]}/orders/{id}.json`, campo: 'uuid', padrao: true };
+      if (!modeloPadraoEnviado) {
+        modeloPadraoEnviado = true;
+        window.postMessage({ channel: CHANNEL, tipo: 'modelo_detalhe', modelo: { url: modeloDetalhe.url, campo: 'uuid', padrao: true } }, '*');
+      }
+    } catch {
+      // Idem.
+    }
   }
 
   function formaDe(v, prof) {
@@ -842,6 +872,7 @@
     try {
       const tipo = classificarResposta(url, status, urlFinal);
       if (!tipo) return;
+      if (tipo === 'ok') aprenderContaDoPainel(url);
       const agora = new Date().toISOString();
       if (tipo === 'ok') {
         estadoPainel.ultimaRespostaOkEm = agora;
@@ -956,6 +987,30 @@
     if (v && typeof v === 'object') for (const k of Object.keys(v).slice(0, 60)) coletarHtmlEmStrings(v[k], saida, prof - 1);
   }
 
+  // Push do próprio MI que só avisa "pedido X mudou": aceita UUID apenas em
+  // campo com nome de PEDIDO (order_uuid, orderUuid, order_id, orderId,
+  // pedido_id…). Sai como candidato incerto (consultado 1 vez).
+  const CHAVE_ID_PEDIDO = /^(order|pedido)_?(uuid|id)$/i;
+  function emitirIdsDePedidoNoPush(json) {
+    try {
+      const itens = new Map();
+      const andar = (v, prof) => {
+        if (prof < 0 || !v || typeof v !== 'object' || itens.size >= 50) return;
+        for (const k of Object.keys(v).slice(0, 60)) {
+          const x = v[k];
+          if (CHAVE_ID_PEDIDO.test(k) && typeof x === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(x)) {
+            const id = x.toLowerCase();
+            itens.set(id, { id, codigo: null, marca: null, assinatura: hashTexto(JSON.stringify(v).slice(0, 2000)), criadoEm: null, incerto: true });
+          } else andar(x, prof - 1);
+        }
+      };
+      andar(json, 4);
+      if (itens.size > 0) window.postMessage({ channel: CHANNEL, tipo: 'lista_pedidos', itens: [...itens.values()] }, '*');
+    } catch {
+      // Idem.
+    }
+  }
+
   function observarMensagemWs(urlWs, dado) {
     try {
       if (typeof dado !== 'string' || dado.length > 2_000_000) return;
@@ -971,12 +1026,18 @@
       let json = null;
       try { json = textoDeMensagemJson(JSON.parse(dado), 3); } catch { /* não-JSON */ }
       if (json !== null) {
-        const evento = json && typeof json === 'object' && typeof json.event === 'string' ? `#${json.event.replace(/[^\w.:-]/g, '').slice(0, 60)}` : '';
+        // Nome do evento (Pusher: event) ou do canal (ActionCable do MI:
+        // identifier.channel — o painel usa www.menuintegrado.com.br/cable).
+        const nomeEvento = json && typeof json === 'object'
+          ? (typeof json.event === 'string' ? json.event : (json.identifier && typeof json.identifier.channel === 'string' ? json.identifier.channel : (typeof json.type === 'string' ? json.type : '')))
+          : '';
+        const evento = nomeEvento ? `#${nomeEvento.replace(/[^\w.:-]/g, '').slice(0, 60)}` : '';
         registrarForma(`${rota}${evento}`.slice(0, 200), 200, formaDe(json, 4));
         emitirResumosDaLista(json);
         const htmls = [];
         coletarHtmlEmStrings(json, htmls, 4);
         for (const h of htmls) emitirResumosDoHtml(h);
+        if (ehDoMenuIntegrado(String(urlWs).replace(/^ws/, 'http'))) emitirIdsDePedidoNoPush(json);
       } else if (pareceHtml(dado)) {
         registrarForma(rota, 200, esqueletoHtml(dado));
         emitirResumosDoHtml(dado);

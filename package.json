@@ -1,7 +1,7 @@
 {
   "name": "mi-capture-agent",
   "private": true,
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "VERYS Connect — Capture Agent do Menu Integrado (extensao de navegador)",
   "scripts": {
     "test": "node tests/background.retry.test.mjs && node tests/page-hook.normalizarPedido.test.mjs && node tests/sinal-captura.test.mjs && node tests/diagnostico-estrutura.test.mjs && node tests/sincronizacao-automatica.test.mjs"

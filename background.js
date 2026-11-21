@@ -536,7 +536,10 @@ async function registrarModelo(modelo) {
   if (!(host === 'menuintegrado.com.br' || host.endsWith('.menuintegrado.com.br')) || !modelo.url.includes('{id}')) return;
   await emSerie(async () => {
     const sync = await lerSync();
-    sync.modelo = { url: modelo.url.slice(0, 300), campo: modelo.campo, aprendidoEm: new Date().toISOString() };
+    // Modelo padrão (montado da conta do painel) nunca substitui um modelo
+    // aprendido de um detalhe real.
+    if (modelo.padrao && sync.modelo && !sync.modelo.padrao) return;
+    sync.modelo = { url: modelo.url.slice(0, 300), campo: modelo.campo, padrao: !!modelo.padrao, aprendidoEm: new Date().toISOString() };
     await chrome.storage.local.set({ [STORAGE_KEYS.sync]: sync });
   });
 }
@@ -591,7 +594,13 @@ async function rodadaDeConsulta() {
   try {
     const agoraMs = Date.now();
     const [sync, painel] = await Promise.all([lerSync(), lerChave(STORAGE_KEYS.painel, painelVazio())]);
-    const pedidos = escolherConsultas(sync, agoraMs);
+    // Limite GLOBAL: no máximo MAX_POR_RODADA consultas em qualquer janela de
+    // 60 s, somando as rodadas do alarme e as disparadas pela lista (achado no
+    // teste de 21/11: só o limite por rodada deixava passar 17 num minuto).
+    const pedidasNoMinuto = (sync.pedidasEm || []).filter((em) => agoraMs - Date.parse(em) < 60 * 1000).length;
+    const vagas = MAX_POR_RODADA - pedidasNoMinuto;
+    if (vagas <= 0) return;
+    const pedidos = escolherConsultas(sync, agoraMs).slice(0, vagas);
     if (pedidos.length === 0) return;
     const aba = escolherAba(painel, agoraMs);
     if (aba == null || Number.isNaN(aba)) return;
@@ -599,7 +608,9 @@ async function rodadaDeConsulta() {
     // repetir o mesmo pedido se a resposta demorar.
     await emSerie(async () => {
       const s = await lerSync();
-      for (const { id } of pedidos) if (s.pedidos[id]) s.pedidos[id].buscaEm = new Date(agoraMs).toISOString();
+      const em = new Date(agoraMs).toISOString();
+      for (const { id } of pedidos) if (s.pedidos[id]) s.pedidos[id].buscaEm = em;
+      s.pedidasEm = [...(s.pedidasEm || []).filter((x) => agoraMs - Date.parse(x) < 60 * 1000), ...pedidos.map(() => em)];
       await chrome.storage.local.set({ [STORAGE_KEYS.sync]: s });
     });
     await chrome.tabs.sendMessage(aba, { type: 'buscar_detalhes', pedidos, modelo: sync.modelo ?? null }).catch(() => {});
