@@ -244,6 +244,16 @@ async function registrarSinalPainel(tabId, estado) {
     if (tabId != null) {
       painel.abas[tabId] = { ...(painel.abas[tabId] || { paginaLogin: false }), vistoEm: agora };
     }
+    // v1.7.1: estrutura das respostas (só rota mascarada e nomes de campos).
+    // Fica a versão mais recente de cada rota, no máximo 40.
+    if (Array.isArray(estado.rotas)) {
+      painel.rotas = painel.rotas || {};
+      for (const r of estado.rotas) {
+        if (!r || typeof r.rota !== 'string' || typeof r.forma !== 'string') continue;
+        if (!painel.rotas[r.rota] && Object.keys(painel.rotas).length >= 40) continue;
+        painel.rotas[r.rota] = { rota: r.rota, vezes: Number(r.vezes) || 0, status: Number(r.status) || 0, ultimaEm: typeof r.ultimaEm === 'string' ? r.ultimaEm : null, forma: r.forma.slice(0, 4000) };
+      }
+    }
     await chrome.storage.local.set({ [STORAGE_KEYS.painel]: painel });
   });
 }
@@ -325,6 +335,11 @@ async function montarSinal(agoraMs) {
     pedidos: {
       ultimoVistoEm: Object.values(observados).reduce((max, o) => (!max || o.vistoEm > max ? o.vistoEm : max), null),
       observados: Object.entries(observados).map(([id, o]) => ({ id, vistoEm: o.vistoEm, marca: o.marca ?? null })),
+    },
+    // v1.7.1: estrutura das respostas do painel (sem valores) — base para
+    // ler automaticamente o que o painel recebe sozinho.
+    diagnostico: {
+      rotas: Object.values(painel.rotas || {}).sort((a, b) => b.vezes - a.vezes).slice(0, 40),
     },
   };
 }

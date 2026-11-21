@@ -234,7 +234,7 @@ async function testarPageHook() {
   await ph.buscar('/api/orders?status=open', 200);
   verificar('1ª resposta 2xx do painel emite sinal na hora', ph.sinais().length === 1
     && typeof ph.sinais()[0].estado.ultimaRespostaOkEm === 'string' && ph.sinais()[0].estado.respostasOk === 1, ph.sinais());
-  verificar('sinal do painel não carrega conteúdo da resposta', Object.keys(ph.sinais()[0].estado).sort().join() === 'respostasOk,ultimaFalhaSessaoEm,ultimaRespostaOkEm');
+  verificar('sinal do painel não carrega conteúdo da resposta (v1.7.1: + rotas, só estrutura)', Object.keys(ph.sinais()[0].estado).sort().join() === 'respostasOk,rotas,ultimaFalhaSessaoEm,ultimaRespostaOkEm' && ph.sinais()[0].estado.rotas.every((r) => !JSON.stringify(r).includes('Teste')), ph.sinais()[0].estado);
 
   await ph.buscar('/api/orders?status=open', 200);
   await ph.buscar('/api/orders?status=open', 200);

@@ -37,15 +37,19 @@
   // Extrai o bloco de dados estruturados escondido dentro do detailsHTML.
   // O valor do atributo vem com entities HTML (&quot; no lugar de ") em
   // vez de aspas literais, por isso o decode manual antes do JSON.parse.
-  function extrairOrderDoDetailsHTML(html) {
-    const match = html.match(/data-name="CompleteOrder"\s+data-attributes="([^"]*)"/);
-    if (!match) return null;
-    const decodificado = match[1]
+  function decodificarAtributo(valor) {
+    return valor
       .replace(/&quot;/g, '"')
       .replace(/&#39;/g, "'")
       .replace(/&lt;/g, '<')
       .replace(/&gt;/g, '>')
       .replace(/&amp;/g, '&');
+  }
+
+  function extrairOrderDoDetailsHTML(html) {
+    const match = html.match(/data-name="CompleteOrder"\s+data-attributes="([^"]*)"/);
+    if (!match) return null;
+    const decodificado = decodificarAtributo(match[1]);
     try {
       const parsed = JSON.parse(decodificado);
       return parsed && parsed.order ? parsed.order : null;
@@ -437,10 +441,80 @@
     }
   }
 
+  // --- Diagnóstico de estrutura (v1.7.1) ---
+  // Achado de 20/11/2026: com o painel aberto e sem interação, nenhum pedido
+  // novo nem mudança de status chegava ao VERYS — só o DETALHE do pedido
+  // (detailsHTML) é reconhecido, e ele só é carregado quando alguém abre o
+  // pedido. Para ler o que o painel recebe SOZINHO, primeiro é preciso saber o
+  // formato dessas respostas. Aqui guardamos só a ESTRUTURA: rota (ids
+  // mascarados, só nomes dos parâmetros) e nomes de campos/tipos. Nunca um
+  // valor: textos viram "str", números "num"; chave que pareça dado (número
+  // longo, e-mail, id) vira ":k". Componentes embutidos no HTML
+  // (data-name/data-attributes) entram só com nome e estrutura.
+  const MAX_ROTAS = 40;
+  const MAX_FORMA = 4000;
+  const SEGMENTO_ID = /^(\d+|[0-9a-f]{8}-[0-9a-f-]{20,}|[0-9a-f]{16,}|[A-Za-z0-9_-]{24,})$/i;
+  const CHAVE_DADO = /^\d{3,}$|@|^[0-9a-f-]{16,}$|^\+?\d[\d\s().-]{6,}$/i;
+  const estruturas = new Map(); // rota -> { rota, vezes, status, ultimaEm, forma }
+
+  function mascararRota(url) {
+    const base = typeof location !== 'undefined' ? location.href : 'https://painel.menuintegrado.com.br/';
+    const u = new URL(url, base);
+    const caminho = u.pathname.split('/').map((s) => (SEGMENTO_ID.test(s) ? ':id' : s)).join('/');
+    const params = [...new Set([...u.searchParams.keys()])].filter((k) => /^[\w.-]{1,40}$/.test(k)).sort().join('&');
+    return (caminho + (params ? `?${params}` : '')).slice(0, 200);
+  }
+
+  function formaDe(v, prof) {
+    if (v === null) return 'null';
+    if (Array.isArray(v)) return `[${v.length ? formaDe(v[0], prof) : ''}]`; // array não consome nível
+    const t = typeof v;
+    if (t === 'object') {
+      if (prof <= 0) return '{…}';
+      const chaves = Object.keys(v);
+      const partes = chaves.slice(0, 40).map((k) => `${CHAVE_DADO.test(k) ? ':k' : k}:${formaDe(v[k], prof - 1)}`);
+      return `{${partes.join(',')}${chaves.length > 40 ? ',…' : ''}}`;
+    }
+    if (t === 'string') return v.includes('data-name="') ? `html${componentesDe(v)}` : 'str';
+    if (t === 'number') return 'num';
+    if (t === 'boolean') return 'bool';
+    return t;
+  }
+
+  function componentesDe(html) {
+    const re = /data-name="([\w-]{1,60})"\s+data-attributes="([^"]*)"/g;
+    const vistos = new Map();
+    let m;
+    while ((m = re.exec(html)) && vistos.size < 20) {
+      if (vistos.has(m[1])) continue;
+      let f = '?';
+      try { f = formaDe(JSON.parse(decodificarAtributo(m[2])), 4); } catch { /* atributo não-JSON */ }
+      vistos.set(m[1], f);
+    }
+    return `[${[...vistos].map(([nome, f]) => nome + f).join(',')}]`;
+  }
+
+  function registrarEstrutura(url, status, texto) {
+    try {
+      if (!ehDoMenuIntegrado(url) || typeof texto !== 'string') return;
+      let forma = null;
+      try { forma = formaDe(JSON.parse(texto), 4); } catch {
+        if (texto.includes('data-name="')) forma = `html${componentesDe(texto)}`;
+      }
+      if (!forma) return; // HTML/JS/CSS comuns não interessam
+      const rota = mascararRota(url);
+      const atual = estruturas.get(rota);
+      if (!atual && estruturas.size >= MAX_ROTAS) return;
+      estruturas.set(rota, { rota, vezes: (atual?.vezes ?? 0) + 1, status: Number(status) || 0, ultimaEm: new Date().toISOString(), forma: forma.slice(0, MAX_FORMA) });
+    } catch {
+      // Nunca interfere na chamada real do Menu Integrado.
+    }
+  }
+
   function emitirSinalPainel() {
     sinalAgendado = false;
     ultimoEnvioSinalEm = Date.now();
-    const estado = { ...estadoPainel };
+    const estado = { ...estadoPainel, rotas: [...estruturas.values()] };
     estadoPainel.respostasOk = 0;
     window.postMessage({ channel: CHANNEL, tipo: 'sinal_painel', estado }, '*');
   }
@@ -496,7 +570,10 @@
       resposta
         .clone()
         .text()
-        .then((texto) => tentarExtrairEEmitir(url, texto))
+        .then((texto) => {
+          registrarEstrutura(url, resposta.status, texto);
+          tentarExtrairEEmitir(url, texto);
+        })
         .catch(() => {});
     } catch {
       // Nunca deixa a observação quebrar a chamada real do Menu Integrado.
@@ -527,7 +604,10 @@
         // Idem.
       }
       try {
-        if (typeof this.responseText === 'string') tentarExtrairEEmitir(this._verysUrl || '', this.responseText);
+        if (typeof this.responseText === 'string') {
+          registrarEstrutura(this._verysUrl || '', this.status, this.responseText);
+          tentarExtrairEEmitir(this._verysUrl || '', this.responseText);
+        }
       } catch {
         // Idem — nunca interfere na requisição real.
       }
