@@ -242,6 +242,7 @@ function criarPageHook() {
 function criarBackground(agoraInicial) {
   const dados = {}; let onMessage = null; let onAlarm = null; const abasMsgs = []; const enviados = []; const alarmes = new Map();
   let agora = agoraInicial;
+  const api = {};
   class FakeDate extends Date { constructor(...a) { super(...(a.length ? a : [agora])); } static now() { return agora; } }
   const chrome = {
     storage: { local: { get: (k) => { const r = {}; for (const x of [].concat(k)) if (x in dados) r[x] = structuredClone(dados[x]); return Promise.resolve(r); }, set: (p) => { Object.assign(dados, structuredClone(p)); return Promise.resolve(); } } },
@@ -249,9 +250,11 @@ function criarBackground(agoraInicial) {
     runtime: { onMessage: { addListener: (f) => { onMessage = f; } }, getManifest: () => ({ version: '1.8.0' }) },
     tabs: { sendMessage: (aba, msg) => { abasMsgs.push({ aba, msg }); return Promise.resolve({ aceito: true }); } },
   };
-  const sb = { chrome, console: { ...console, error: () => {}, warn: () => {} }, crypto: globalThis.crypto, setImmediate, Response, URL, Date: FakeDate, setTimeout: () => 0,
-    fetch: (url, o) => { const b = JSON.parse(o.body); enviados.push(b); return Promise.resolve(new Response(JSON.stringify(b.tipo === 'sinal_captura' ? (api.respostaSinal ?? { ok: true }) : { ok: true }), { status: 200 })); } };
-  const api = {};
+  const sb = { chrome, console: { ...console, error: () => {}, warn: () => {} }, crypto: globalThis.crypto, setImmediate, Response, URL, Date: FakeDate, setTimeout: (fn, ms) => { api.timeouts = [...(api.timeouts || []), ms]; return 0; },
+    fetch: (url, o) => { const b = JSON.parse(o.body); enviados.push(b);
+      if (b.tipo === 'sinal_captura' && api.falharSinal) return Promise.reject(new TypeError('Failed to fetch'));
+      if (b.tipo === 'sinal_captura' && api.atrasoRespostaMs) agora += api.atrasoRespostaMs;
+      return Promise.resolve(new Response(JSON.stringify(b.tipo === 'sinal_captura' ? (api.respostaSinal ?? { ok: true }) : { ok: true }), { status: 200 })); } };
   vm.createContext(sb); vm.runInContext(BACKGROUND, sb, { filename: 'background.js' });
   const msg = (m, aba = 7) => new Promise((r) => onMessage(m, { tab: { id: aba } }, r));
   return Object.assign(api, {
@@ -259,7 +262,17 @@ function criarBackground(agoraInicial) {
     async sinal() { await onAlarm({ name: 'verys_mi_sinal' }); await esperar(); },
     avancar(min) { agora += min * 60000; },
     agora: () => agora,
-    async rodada() { await onAlarm({ name: 'verys_mi_consulta' }); await esperar(); },
+    // v1.8.3: só consulta com autorização de consultor válida. Os cenários
+    // que não tratam do consultor recebem a autorização direto no storage
+    // (autoAutorizar); os de consultor desligam isso e usam o sinal real.
+    autoAutorizar: true,
+    async rodada() {
+      if (api.autoAutorizar) {
+        const s = dados.verys_mi_sync ?? { modelo: null, pausaAte: null, pausaMotivo: null, pedidos: {}, consultas: [] };
+        dados.verys_mi_sync = { ...s, consultor: true, consultorAte: new Date(agora + 3.5 * 60000).toISOString(), consultarApos: null };
+      }
+      await onAlarm({ name: 'verys_mi_consulta' }); await esperar();
+    },
   });
 }
 
@@ -318,6 +331,12 @@ function criarBackground(agoraInicial) {
   bg.abasMsgs.length = 0; await bg.rodada();
   verificar('limite global: no minuto seguinte libera de novo (até 6)', bg.abasMsgs.reduce((s, x) => s + x.msg.pedidos.length, 0) === 6);
 
+  // Ritmo: alarme 3 s antes de o lote sair da janela → rodada reagendada (não perdida).
+  bg.avancar(0.95); bg.timeouts = []; bg.abasMsgs.length = 0; await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
+  const reag = (bg.timeouts || []).find((ms) => ms > 3000 && ms <= 30500);
+  verificar('lote anterior a 57 s: rodada reagendada para quando a vaga abre (~3,5 s), sem passar de 6/60 s', bg.abasMsgs.length === 0 && reag !== undefined && reag <= 5000, bg.timeouts);
+  bg.avancar(0.06);
+
   // Sessão inválida → pausa 10 min.
   await bg.msg({ type: 'detalhe_resultado', id: 'pedido-novo-0000', status: 401, reconhecido: false, motivo: 'http_401' });
   bg.abasMsgs.length = 0; bg.avancar(2); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
@@ -369,20 +388,87 @@ function criarBackground(agoraInicial) {
   bg.abasMsgs.length = 0; bg.avancar(5); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
   verificar('depois de conferido (entregue), não repete mesmo se o VERYS ainda listar por alguns minutos', !bg.abasMsgs.some((x) => x.msg.pedidos.some((p) => p.id === VELHO)));
 
-  // Dois computadores: o VERYS indica o consultor; o outro não consulta.
-  bg.respostaSinal = { ok: true, situacao: { comprovada: false, lojas: [] }, paraConferir: [{ id: 'abababab-1111-4222-8333-444455556666' }], consultor: false };
+  // Lista completa do VERYS: o que saiu dela já foi sincronizado (por outro computador) — não re-consulta.
+  const P1 = 'e1e1e1e1-1111-4222-8333-444455556666', P2 = 'e2e2e2e2-1111-4222-8333-444455556666';
+  bg.respostaSinal = { ok: true, situacao: { comprovada: false, lojas: [] }, paraConferir: [{ id: P1 }, { id: P2 }] };
+  await bg.sinal();
+  bg.respostaSinal = { ok: true, situacao: { comprovada: false, lojas: [] }, paraConferir: [{ id: P2 }] };
   await bg.sinal();
   bg.abasMsgs.length = 0; bg.avancar(2); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
-  verificar('consultor=false: este agente não consulta (outro computador consulta)', bg.abasMsgs.length === 0);
-  bg.respostaSinal = { ok: true, situacao: { comprovada: false, lojas: [] }, paraConferir: [{ id: 'abababab-1111-4222-8333-444455556666' }], consultor: true };
+  const pedidosRodada = bg.abasMsgs.flatMap((x) => x.msg.pedidos.map((p) => p.id));
+  verificar('pedido que saiu da lista do VERYS não é re-consultado; o que continua, é', !pedidosRodada.includes(P1) && pedidosRodada.includes(P2), pedidosRodada);
+  bg.respostaSinal = { ok: true, situacao: { comprovada: true, lojas: [] }, paraConferir: [] };
   await bg.sinal();
-  bg.abasMsgs.length = 0; await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
-  verificar('consultor=true: volta a consultar', bg.abasMsgs.some((x) => x.msg.pedidos.some((p) => p.id === 'abababab-1111-4222-8333-444455556666')));
-  bg.respostaSinal = { ok: true, situacao: { comprovada: false, lojas: [] }, consultor: false };
-  await bg.sinal();
-  bg.avancar(6); await bg.msg({ type: 'lista_pedidos', itens: [{ id: 'cdcdcdcd-1111-4222-8333-444455556666', assinatura: 'z', criadoEm: new Date(bg.agora()).toISOString() }] });
-  bg.abasMsgs.length = 0; await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
-  verificar('sem resposta do VERYS há mais de 5 min, a indicação expira e o agente volta a consultar', bg.abasMsgs.length === 1);
+  verificar('lista vazia do VERYS limpa a conferência', !bg.dados.verys_mi_sync.pedidos[P2]?.conferirEm);
+
+  // Consultor único (v1.8.3).
+  const R = (extra) => ({ ok: true, situacao: { comprovada: false, lojas: [] }, ...extra });
+  const novoPedido = async (id) => { await bg.msg({ type: 'lista_pedidos', itens: [{ id, assinatura: 'z' + bg.agora(), criadoEm: new Date(bg.agora()).toISOString() }] }); };
+  const consultou = async () => { bg.abasMsgs.length = 0; await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada(); return bg.abasMsgs.length > 0; };
+
+  bg.autoAutorizar = false;
+  bg.dados.verys_mi_sync = { ...bg.dados.verys_mi_sync, consultor: undefined, consultorAte: null, consultarApos: null };
+  bg.avancar(1.1); await novoPedido('c0000000-1111-4222-8333-444455556666');
+  verificar('nunca autorizado pelo VERYS: não consulta', !(await consultou()));
+  verificar('popup: aguardando confirmação do VERYS (não "outro computador")', (await bg.msg({ type: 'obter_stats' })).consulta.situacaoConsultor === 'aguardando_confirmacao');
+
+  bg.respostaSinal = R({ consultor: false, agentesAtivos: 2 }); await bg.sinal();
+  bg.avancar(1.1); await novoPedido('c0000001-1111-4222-8333-444455556666');
+  verificar('2 agentes, VERYS diz "não é você": não consulta', !(await consultou()));
+
+  bg.respostaSinal = R({ consultor: true, agentesAtivos: 2 }); await bg.sinal();
+  verificar('2 agentes, VERYS confirma "é você": consulta', await consultou());
+
+  // Já consultor: aguardarMs (outro computador vivo) NÃO interrompe.
+  bg.respostaSinal = R({ consultor: true, agentesAtivos: 2, aguardarMs: 150000 }); await bg.sinal();
+  bg.avancar(1.1); await novoPedido('c0000009-1111-4222-8333-444455556666');
+  verificar('já consultor: a espera informada não interrompe quem já consultava', await consultou());
+  bg.respostaSinal = R({ consultor: true, agentesAtivos: 2 }); await bg.sinal();
+
+  // Perde contato com o VERYS (respostas sem decisão): para ANTES dos 4 min do VERYS.
+  bg.respostaSinal = R({}); await bg.sinal();
+  bg.avancar(3); await novoPedido('c0000002-1111-4222-8333-444455556666');
+  verificar('sem nova confirmação, aos 3 min ainda consulta', await consultou());
+  bg.avancar(0.6); await novoPedido('c0000003-1111-4222-8333-444455556666');
+  verificar('sem confirmação há 3,6 min (antes dos 4 min em que o VERYS passa a vez): para de consultar', !(await consultou()));
+
+  // Volta a ser confirmado (retomada também funciona no sentido inverso).
+  bg.respostaSinal = R({ consultor: true, agentesAtivos: 2 }); await bg.sinal();
+  verificar('confirmado de novo: volta a consultar', await consultou());
+
+  // PASSA a ser consultor com o outro ainda vivo: espera a confirmação do outro expirar.
+  bg.respostaSinal = R({ consultor: false, agentesAtivos: 2 }); await bg.sinal();
+  bg.respostaSinal = R({ consultor: true, agentesAtivos: 2, aguardarMs: 150000 }); await bg.sinal();
+  bg.avancar(1.1); await novoPedido('c0000010-1111-4222-8333-444455556666');
+  verificar('passou a consultor: não consulta durante a espera (troca sem sobreposição)', !(await consultou()));
+  bg.respostaSinal = R({ consultor: true, agentesAtivos: 2, aguardarMs: 30000 }); await bg.sinal();
+  bg.avancar(1.5); await novoPedido('c0000011-1111-4222-8333-444455556666');
+  verificar('passada a espera (2,6 min), consulta', await consultou());
+
+  // Sozinho também: autorização expirada = aguarda nova confirmação.
+  bg.respostaSinal = R({ consultor: true, agentesAtivos: 1 }); await bg.sinal();
+  bg.falharSinal = true; await bg.sinal(); await bg.sinal();
+  bg.avancar(3.4); await novoPedido('c0000004-1111-4222-8333-444455556666');
+  verificar('sozinho, VERYS fora do ar: consulta enquanto a autorização vale (3,4 min)', await consultou());
+  bg.avancar(0.2); await novoPedido('c0000005-1111-4222-8333-444455556666');
+  verificar('sozinho, VERYS fora do ar: autorização expirada (3,6 min) → para de consultar', !(await consultou()));
+  bg.avancar(40); await novoPedido('c0000006-1111-4222-8333-444455556666');
+  verificar('sozinho, VERYS fora do ar por 40 min: continua sem consultar', !(await consultou()));
+  bg.falharSinal = false;
+  bg.respostaSinal = R({ consultor: true, agentesAtivos: 1 }); await bg.sinal();
+  verificar('VERYS de volta e confirma: volta a consultar', await consultou());
+
+  // VERYS antigo (resposta sem `consultor`): não renova; expira e para.
+  bg.respostaSinal = R({}); await bg.sinal();
+  bg.avancar(3.6); await novoPedido('c0000007-1111-4222-8333-444455556666');
+  verificar('VERYS sem decisão de consultor: não consulta depois que a autorização expira', !(await consultou()));
+
+  // Autorização conta do ENVIO do sinal: resposta que demora 50 s encurta a validade.
+  bg.atrasoRespostaMs = 50000;
+  const envio = bg.agora();
+  bg.respostaSinal = R({ consultor: true, agentesAtivos: 1 }); await bg.sinal();
+  bg.atrasoRespostaMs = 0;
+  verificar('autorização vale 3,5 min a partir do envio (não da chegada da resposta)', Date.parse(bg.dados.verys_mi_sync.consultorAte) === envio + 3.5 * 60000, bg.dados.verys_mi_sync.consultorAte);
 
   // Resumo para o popup.
   const stats = await bg.msg({ type: 'obter_stats' });

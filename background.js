@@ -354,23 +354,50 @@ async function montarSinal(agoraMs) {
 async function enviarSinal() {
   const config = await getConfig();
   if (!config?.ingestUrl || !config?.token) return;
-  const sinal = await montarSinal(Date.now());
+  // Momento do ENVIO: a autorização de consultor conta a partir daqui (nunca
+  // da chegada da resposta) — assim ela expira antes, em tempo real, do
+  // instante em que o VERYS registrou o sinal + 3,5 min, que é o que o VERYS
+  // usa para calcular a espera de quem assume. Independe do relógio local.
+  const enviadoEm = Date.now();
+  const sinal = await montarSinal(enviadoEm);
   const resultado = await tentarEnviar(sinal, config);
   const situacao = resultado.enviado && resultado.corpo && typeof resultado.corpo.situacao === 'object' ? resultado.corpo.situacao : null;
   if (resultado.enviado && Array.isArray(resultado.corpo?.paraConferir)) {
     await registrarParaConferir(resultado.corpo.paraConferir);
     agendarRodada();
   }
-  // v1.8.2: com mais de um computador, o VERYS indica UM agente consultor
-  // (os outros só capturam o que o painel mostra — sem consulta em dobro ao
-  // MI). Sem resposta ou campo ausente: continua consultando.
-  if (resultado.enviado && typeof resultado.corpo?.consultor === 'boolean') {
-    await emSerie(async () => {
-      const s = await lerSync();
-      s.consultor = resultado.corpo.consultor;
-      s.consultorAte = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-      await chrome.storage.local.set({ [STORAGE_KEYS.sync]: s });
-    });
+  // v1.8.3: o VERYS indica UM agente consultor (os outros só capturam o que o
+  // painel mostra). A autorização vale CONFIRMACAO_CONSULTOR_MS (3,5 min) a
+  // partir do envio, menos que os 4 min que o VERYS espera para passar a vez:
+  // quem perde contato para de consultar ANTES de o outro começar — nunca dois
+  // juntos. Sem resposta, ou resposta sem `consultor` (VERYS antigo, falha de
+  // leitura), nada é renovado: a autorização expira e o agente aguarda nova
+  // confirmação, mesmo sozinho.
+  if (resultado.enviado && resultado.corpo && typeof resultado.corpo === 'object') {
+    const { consultor, agentesAtivos } = resultado.corpo;
+    if (typeof consultor === 'boolean' || (Number.isInteger(agentesAtivos) && agentesAtivos > 0)) {
+      await emSerie(async () => {
+        const s = await lerSync();
+        const agora = Date.now();
+        if (typeof consultor === 'boolean') {
+          const jaEraConsultor = s.consultor === true && s.consultorAte && Date.parse(s.consultorAte) > agora;
+          if (consultor && !jaEraConsultor) {
+            // Passou a ser consultor: espera a confirmação de quem consultava
+            // antes expirar (aguardarMs do VERYS) — troca sem sobreposição.
+            const aguardar = Number.isFinite(resultado.corpo.aguardarMs) ? Math.min(Math.max(resultado.corpo.aguardarMs, 0), CONFIRMACAO_CONSULTOR_MS) : 0;
+            s.consultarApos = new Date(agora + aguardar).toISOString();
+          }
+          if (!consultor) s.consultarApos = null;
+          s.consultor = consultor;
+          s.consultorAte = new Date(enviadoEm + CONFIRMACAO_CONSULTOR_MS).toISOString();
+        }
+        if (Number.isInteger(agentesAtivos) && agentesAtivos > 0) {
+          s.agentesAtivos = agentesAtivos;
+          s.agentesAtivosAte = new Date(agora + MEMORIA_AGENTES_MS).toISOString();
+        }
+        await chrome.storage.local.set({ [STORAGE_KEYS.sync]: s });
+      });
+    }
   }
   await chrome.storage.local.set({
     [STORAGE_KEYS.ultimoSinal]: { em: new Date().toISOString(), ok: resultado.enviado, motivo: resultado.motivo ?? null, situacao },
@@ -410,6 +437,32 @@ const MAX_INCERTOS_POR_RODADA = 2;
 const JANELA_CONFERIR_MS = 72 * 60 * 60 * 1000;
 const RECONFERIR_MS = 15 * 60 * 1000;
 const MAX_PARA_CONFERIR = 100;
+// Consultor único (v1.8.3): confirmação vale 3,5 min (< 4 min do VERYS para
+// passar a vez); número de agentes ativos lembrado por 30 min.
+const CONFIRMACAO_CONSULTOR_MS = 3.5 * 60 * 1000;
+const MEMORIA_AGENTES_MS = 30 * 60 * 1000;
+
+// Pode consultar o MI agora? Só com autorização de consultor VÁLIDA, em
+// qualquer caso (sozinho ou com outros computadores):
+//   * 'outro_consultor'         → VERYS disse "não é você" (recente);
+//   * 'aguardando_confirmacao'  → nunca autorizado, ou a autorização expirou
+//                                  (sem resposta do VERYS): espera o próximo sinal;
+//   * 'aguardando_troca'        → autorizado, mas a autorização do consultor
+//                                  anterior ainda pode estar valendo;
+//   * 'ok'                      → consulta.
+// Sem consulta, a captura do que o painel mostra continua; o que ficar parado
+// é recuperado pela lista "para conferir" quando a autorização voltar.
+function situacaoConsultor(sync, agoraMs) {
+  const valida = !!sync.consultorAte && Date.parse(sync.consultorAte) > agoraMs;
+  if (!valida) return 'aguardando_confirmacao';
+  if (sync.consultor !== true) return 'outro_consultor';
+  if (sync.consultarApos && Date.parse(sync.consultarApos) > agoraMs) return 'aguardando_troca';
+  return 'ok';
+}
+
+function podeConsultarAgora(sync, agoraMs) {
+  return situacaoConsultor(sync, agoraMs) === 'ok';
+}
 
 function syncVazio() {
   return { modelo: null, pausaAte: null, pausaMotivo: null, pedidos: {}, consultas: [] };
@@ -516,11 +569,25 @@ async function registrarDetalhe(payload) {
 // Lista que o VERYS devolve na resposta do sinal: pedidos em andamento lá sem
 // sincronização recente (ex.: os que ficaram parados numa queda). Só ids do MI.
 async function registrarParaConferir(lista) {
-  if (!Array.isArray(lista) || lista.length === 0) return;
+  if (!Array.isArray(lista)) return;
   await emSerie(async () => {
     const sync = await lerSync();
     const agoraMs = Date.now();
     const agora = new Date(agoraMs).toISOString();
+    // Lista COMPLETA (abaixo do teto do VERYS): o que ficou de fora já foi
+    // sincronizado (por este ou por outro computador) — sai da conferência.
+    // Achado no teste com dois computadores: o que assumiu re-consultava os
+    // pedidos que o outro já tinha recuperado.
+    if (lista.length < MAX_PARA_CONFERIR) {
+      const naLista = new Set(lista.map((item) => (typeof item === 'string' ? item : item?.id)));
+      for (const [id, p] of Object.entries(sync.pedidos || {})) {
+        if (p.conferirEm && !naLista.has(id)) {
+          p.conferirEm = null;
+          // Entrou só pela lista do VERYS (nunca visto no painel): resolvido.
+          if (!p.detalheEm && !p.listaEm) p.final = true;
+        }
+      }
+    }
     for (const item of lista.slice(0, MAX_PARA_CONFERIR)) {
       const id = typeof item === 'string' ? item : item?.id;
       if (!idValido(id)) continue;
@@ -608,10 +675,17 @@ async function rodadaDeConsulta() {
     // Limite GLOBAL: no máximo MAX_POR_RODADA consultas em qualquer janela de
     // 60 s, somando as rodadas do alarme e as disparadas pela lista (achado no
     // teste de 21/11: só o limite por rodada deixava passar 17 num minuto).
-    if (sync.consultor === false && sync.consultorAte && Date.parse(sync.consultorAte) > agoraMs) return;
+    if (!podeConsultarAgora(sync, agoraMs)) return;
     const pedidasNoMinuto =(sync.pedidasEm || []).filter((em) => agoraMs - Date.parse(em) < 60 * 1000).length;
     const vagas = MAX_POR_RODADA - pedidasNoMinuto;
-    if (vagas <= 0) return;
+    if (vagas <= 0) {
+      // Achado no teste de 21/11: o alarme de 1 min caía segundos ANTES de o
+      // lote anterior sair da janela de 60 s, a rodada era pulada e o ritmo
+      // real ficava ~3/min. Se a vaga abre em até 30 s, reagenda para ela.
+      const espera = msAteProximaVaga(sync, agoraMs);
+      if (espera !== null && espera <= 30 * 1000) agendarRodada(espera + 500);
+      return;
+    }
     const pedidos = escolherConsultas(sync, agoraMs).slice(0, vagas);
     if (pedidos.length === 0) return;
     const aba = escolherAba(painel, agoraMs);
@@ -632,9 +706,17 @@ async function rodadaDeConsulta() {
 }
 
 let rodadaAgendada = null;
-function agendarRodada() {
+function agendarRodada(atrasoMs = 3000) {
   if (rodadaAgendada) return;
-  rodadaAgendada = setTimeout(() => { rodadaAgendada = null; rodadaDeConsulta(); }, 3000);
+  rodadaAgendada = setTimeout(() => { rodadaAgendada = null; rodadaDeConsulta(); }, atrasoMs);
+}
+
+// Quanto falta para a consulta mais antiga da janela de 60 s sair dela (e abrir
+// uma vaga). null = já há vaga ou nada registrado.
+function msAteProximaVaga(sync, agoraMs) {
+  const recentes = (sync.pedidasEm || []).map((em) => Date.parse(em)).filter((ms) => agoraMs - ms < 60 * 1000).sort((a, b) => a - b);
+  if (recentes.length < MAX_POR_RODADA) return null;
+  return Math.max(0, recentes[recentes.length - MAX_POR_RODADA] + 60 * 1000 - agoraMs);
 }
 
 // Ao iniciar: pedidos já vistos (observados, até 12 h) entram no controle da
@@ -668,7 +750,8 @@ function resumoConsulta(sync, agoraMs) {
   const ultimaOk = consultas.filter((c) => c.ok).reduce((m, c) => (!m || c.em > m ? c.em : m), null);
   const pausada = sync.pausaAte && Date.parse(sync.pausaAte) > agoraMs;
   return {
-    outroComputadorConsulta: sync.consultor === false && !!sync.consultorAte && Date.parse(sync.consultorAte) > agoraMs,
+    situacaoConsultor: situacaoConsultor(sync, agoraMs),
+    outroComputadorConsulta: situacaoConsultor(sync, agoraMs) === 'outro_consultor',
     modeloAprendido: !!sync.modelo,
     pausadaAte: pausada ? sync.pausaAte : null,
     pausaMotivo: pausada ? sync.pausaMotivo : null,
@@ -751,6 +834,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   await garantirAlarmeSinal();
   await garantirAlarmeConsulta();
   await importarObservados();
+  // v1.8.3: sinal logo ao iniciar (não só depois de 2 min) — com outro
+  // computador na loja, a decisão de consultor chega em segundos.
+  enviarSinal().catch(() => {});
   const pendentes = await getPendentes();
   if (Object.keys(pendentes).length > 0) {
     await garantirAlarmeRetentativa();
