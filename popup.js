@@ -61,6 +61,7 @@ function descreverConexaoPainel(painel, ultimoSinal, agoraMs) {
 
 function descreverConsulta(consulta) {
   if (!consulta) return null;
+  if (consulta.outroComputadorConsulta) return 'consulta automática feita por outro computador da loja (este só captura o que o painel mostra)';
   if (consulta.pausadaAte) {
     const motivo = consulta.pausaMotivo === 'sessao_mi' ? 'a sessão do MI recusou a consulta'
       : consulta.pausaMotivo === 'sem_conexao' ? 'sem conexão com o MI'

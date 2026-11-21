@@ -336,14 +336,43 @@
     return null;
   }
 
-  function extrairHistoricoStatus(html, dataAncora) {
+  // v1.8.2 — data de cada etapa "HH:mm" SEM inventar (achado real 21/11/2026,
+  // pedido #644539 criado 20/11 23:58: o MI não lista as etapas em ordem
+  // cronológica, e a regra antiga "voltou no tempo em relação à linha
+  // anterior = virou o dia" deixou Pronto/Enviado/Entregue de 00:10–00:15 em
+  // 20/11 — ganho e caixa um dia antes). Regra nova, independente da ordem:
+  //   * "Entregue": horário completo do próprio pedido (order.deliveredAt),
+  //     quando existe — é a fonte exata;
+  //   * demais etapas: dias candidatos com aquele HH:mm dentro da janela
+  //     [criação − 30 min, entrega] (ou [criação − 30 min, agora] se ainda não
+  //     entregue). Um candidato só = essa data. Nenhum na janela, mas um nas
+  //     24 h antes da criação = etapa anterior à criação (aceita). Mais de um
+  //     (agendado / mais de um dia) = AMBÍGUO: a etapa fica de fora;
+  //   * "Entrega prevista" (estimativa): janela [criação − 30 min, criação +
+  //     23 h 30]; fora disso, fica de fora.
+  // Datas completas no HTML ("DD/MM HH:mm", "DD/MM/AAAA HH:mm") valem direto.
+  const TOLERANCIA_ANTES_MS = 30 * 60 * 1000;
+  const DIA_MS = 24 * 60 * 60 * 1000;
+
+  function candidatosNaJanela(base, hora, minuto, de, ate) {
+    const saida = [];
+    for (let k = -2; k <= 7; k++) {
+      const d = new Date(base.getFullYear(), base.getMonth(), base.getDate() + k, hora, minuto);
+      if (d.getTime() >= de && d.getTime() <= ate) saida.push(d);
+    }
+    return saida;
+  }
+
+  function extrairHistoricoStatus(html, dataAncora, entregueEm = null, agora = new Date()) {
     const historico = [];
     let previsaoEntrega = null;
+    let ambiguos = 0;
     const linhaRegex = /<small>([^<]+)<\/small>\s*<\/td>\s*<td class="pl-2">\s*([^<]+?)\s*<\/td>/g;
     let match;
 
-    let diaCorrente = new Date(dataAncora.getFullYear(), dataAncora.getMonth(), dataAncora.getDate());
-    let horaMinutoAnterior = null;
+    const diaCorrente = new Date(dataAncora.getFullYear(), dataAncora.getMonth(), dataAncora.getDate());
+    const criacao = dataAncora.getTime();
+    const fim = entregueEm ? entregueEm.getTime() : agora.getTime();
 
     while ((match = linhaRegex.exec(html)) !== null) {
       const rotulo = match[1].trim();
@@ -362,22 +391,28 @@
         // heurística de virada de ano/mês.
         const ano = parsed.temAno ? parsed.ano : dataAncora.getFullYear();
         dataEvento = new Date(ano, parsed.mes, parsed.dia, parsed.hora, parsed.minuto);
+      } else if (rotulo === 'Entregue' && entregueEm) {
+        dataEvento = entregueEm;
+      } else if (rotulo === 'Recebido' && candidatosNaJanela(diaCorrente, parsed.hora, parsed.minuto, criacao - TOLERANCIA_ANTES_MS, criacao + TOLERANCIA_ANTES_MS).length === 1) {
+        // Recebido = aceite, colado à criação: janela estreita (±30 min) tem
+        // uma data só, mesmo em pedido agendado para outro dia.
+        dataEvento = candidatosNaJanela(diaCorrente, parsed.hora, parsed.minuto, criacao - TOLERANCIA_ANTES_MS, criacao + TOLERANCIA_ANTES_MS)[0];
       } else if (ehEventoSequencial) {
-        // Só eventos sequenciais reais avançam o dia corrente. "Entrega
-        // prevista" é uma ESTIMATIVA (calculada na criação do pedido) —
-        // pode ter horário menor que "Enviado" se o pedido atrasou, o que
-        // não significa virada de dia nenhuma (achado real 2026-08-02:
-        // isso fazia "Entregue" pular um dia inteiro por engano).
-        const horaMinutoAtual = parsed.hora * 60 + parsed.minuto;
-        if (horaMinutoAnterior !== null && horaMinutoAtual < horaMinutoAnterior) {
-          diaCorrente = new Date(diaCorrente.getFullYear(), diaCorrente.getMonth(), diaCorrente.getDate() + 1);
+        const naJanela = candidatosNaJanela(diaCorrente, parsed.hora, parsed.minuto, criacao - TOLERANCIA_ANTES_MS, fim + 60 * 1000);
+        if (naJanela.length === 1) {
+          dataEvento = naJanela[0];
+        } else if (naJanela.length === 0) {
+          const antes = candidatosNaJanela(diaCorrente, parsed.hora, parsed.minuto, criacao - DIA_MS, criacao - TOLERANCIA_ANTES_MS - 1);
+          if (antes.length !== 1) { ambiguos += 1; continue; }
+          dataEvento = antes[0]; // etapa anterior à criação (ex.: aceite antes do registro)
+        } else {
+          ambiguos += 1; // agendado / mais de um dia: não inventa
+          continue;
         }
-        horaMinutoAnterior = horaMinutoAtual;
-        dataEvento = new Date(diaCorrente.getFullYear(), diaCorrente.getMonth(), diaCorrente.getDate(), parsed.hora, parsed.minuto);
       } else {
-        // Entrega prevista: usa o dia corrente já resolvido pelos eventos
-        // sequenciais até aqui, sem alterar o rastreador de virada de dia.
-        dataEvento = new Date(diaCorrente.getFullYear(), diaCorrente.getMonth(), diaCorrente.getDate(), parsed.hora, parsed.minuto);
+        const naJanela = candidatosNaJanela(diaCorrente, parsed.hora, parsed.minuto, criacao - TOLERANCIA_ANTES_MS, criacao + DIA_MS - TOLERANCIA_ANTES_MS - 1);
+        if (naJanela.length !== 1) { ambiguos += 1; continue; }
+        dataEvento = naJanela[0];
       }
 
       if (isNaN(dataEvento.getTime())) continue;
@@ -389,7 +424,20 @@
         previsaoEntrega = iso;
       }
     }
-    return { historico, previsaoEntrega };
+    // Entregue sem linha no HTML, mas com o horário no próprio pedido: usa.
+    if (entregueEm && !historico.some((h) => h.status === 'Entregue')) {
+      historico.push({ status: 'Entregue', timestamp: entregueEm.toISOString() });
+    }
+    return { historico, previsaoEntrega, ambiguos };
+  }
+
+  // order.deliveredAt (horário completo do MI) só vale se for data válida e não
+  // anterior à criação (com a mesma tolerância).
+  function horarioDeEntrega(order, dataAncora) {
+    if (typeof order.deliveredAt !== 'string') return null;
+    const d = new Date(order.deliveredAt);
+    if (Number.isNaN(d.getTime()) || d.getTime() < dataAncora.getTime() - TOLERANCIA_ANTES_MS) return null;
+    return d;
   }
 
   // Devolve true quando reconheceu e emitiu um pedido completo (detalhe).
@@ -418,8 +466,9 @@
           const ramal = extrairRamalIfood(json.detailsHTML);
           if (ramal) pedido.customer.phone.extension = ramal;
           const dataAncora = order.createdAt ? new Date(order.createdAt) : new Date();
-          const { historico, previsaoEntrega } = extrairHistoricoStatus(json.detailsHTML, dataAncora);
+          const { historico, previsaoEntrega, ambiguos } = extrairHistoricoStatus(json.detailsHTML, dataAncora, horarioDeEntrega(order, dataAncora), new Date());
           if (historico.length > 0) pedido.statusHistory = historico;
+          if (ambiguos > 0) pedido._historicoAmbiguo = ambiguos; // etapas sem data segura (não enviadas)
           if (previsaoEntrega) pedido.previsaoEntrega = previsaoEntrega;
           notificar(pedido);
           return true;
