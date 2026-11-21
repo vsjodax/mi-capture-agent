@@ -62,7 +62,9 @@ function descreverConexaoPainel(painel, ultimoSinal, agoraMs) {
 function descreverConsulta(consulta) {
   if (!consulta) return null;
   if (consulta.pausadaAte) {
-    const motivo = consulta.pausaMotivo === 'sessao_mi' ? 'a sessão do MI recusou a consulta' : `o MI respondeu ${String(consulta.pausaMotivo ?? '').replace('mi_http_', 'HTTP ')}`;
+    const motivo = consulta.pausaMotivo === 'sessao_mi' ? 'a sessão do MI recusou a consulta'
+      : consulta.pausaMotivo === 'sem_conexao' ? 'sem conexão com o MI'
+        : `o MI respondeu ${String(consulta.pausaMotivo ?? '').replace('mi_http_', 'HTTP ')}`;
     return `consulta automática pausada até ${formatarData(consulta.pausadaAte)} (${motivo})`;
   }
   if (!consulta.modeloAprendido) return 'consulta automática aguardando o painel carregar um detalhe de pedido uma vez';

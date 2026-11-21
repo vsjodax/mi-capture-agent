@@ -52,12 +52,19 @@ function criarPageHook() {
     postMessage: (m) => { postados.push(m); for (const f of ouvintes) setImmediate(() => f({ source: window_, data: m })); },
     addEventListener: (tipo, f) => { if (tipo === 'message') ouvintes.push(f); },
   };
+  const sockets = [];
+  function FakeWS(url) { this.url = url; this.ouvintes = []; sockets.push(this); }
+  FakeWS.prototype.addEventListener = function (t, fn) { if (t === 'message') this.ouvintes.push(fn); };
+  window_.WebSocket = FakeWS;
   function XHR() {} XHR.prototype.open = function () {}; XHR.prototype.send = function () {}; XHR.prototype.addEventListener = function () {}; XHR.prototype.setRequestHeader = function () {};
   const sandbox = { window: window_, XMLHttpRequest: XHR, location: { href: 'https://painel.menuintegrado.com.br/pedidos', pathname: '/pedidos' },
     setTimeout: (fn) => { timers.push(fn); return timers.length; }, console, JSON, Object, Array, String, RegExp, Date, Promise, Map, Set, URL, Number, encodeURIComponent };
   vm.createContext(sandbox); vm.runInContext(PAGE_HOOK, sandbox, { filename: 'page-hook.js' });
   return {
-    postados, chamadas, respostas,
+    postados, chamadas, respostas, sockets,
+    novoWs(url) { return new window_.WebSocket(url); },
+    async wsRecebe(ws, dado) { for (const fn of ws.ouvintes) fn({ data: dado }); await esperar(); },
+    rodarTimers() { while (timers.length) timers.shift()(); },
     async painelPede(url, opcoes) { await sandbox.window.fetch(url, opcoes); await esperar(); },
     async extensaoPede(pedidos, modelo = null) {
       window_.postMessage({ channel: 'verys-mi-capture', tipo: 'buscar_detalhes', pedidos, modelo });
@@ -138,6 +145,40 @@ function criarPageHook() {
   await ph3.painelPede('https://api.menuintegrado.com.br/orders?status=open', { method: 'GET' });
   const resumo2 = ph3.postados.filter((m) => m.tipo === 'lista_pedidos').at(-1);
   verificar('mudança de status muda a assinatura', resumo2.itens[0].assinatura !== resumo.itens[0].assinatura && resumo2.itens[1].assinatura === resumo.itens[1].assinatura);
+}
+
+// ---------------------------------------------- lista por HTML simples e WebSocket
+{
+  const ph = criarPageHook();
+  const frag = `<div class="card status-producing"><a href="/orders/${UUID}" data-id="${UUID}">#537420 Fulano de Tal 19:05</a><span>Rua das Flores</span></div><div class="card"><a href="/orders/${UUID2}">#537421</a></div>`;
+  ph.respostas.set('https://painel.menuintegrado.com.br/orders/cards', { status: 200, texto: frag });
+  await ph.painelPede('https://painel.menuintegrado.com.br/orders/cards', { method: 'GET' });
+  const lh = ph.postados.filter((m) => m.tipo === 'lista_pedidos').at(-1);
+  verificar('fragmento HTML: ids de pedido achados nos atributos, marcados incertos', lh?.itens?.length === 2 && lh.itens.every((i) => i.incerto === true) && lh.itens[0].id === UUID, lh);
+  verificar('fragmento HTML: nenhum texto do card sai (nome, endereço)', !SENSIVEIS.some((v) => JSON.stringify(lh).includes(v)));
+  ph.respostas.set('https://painel.menuintegrado.com.br/orders/cards', { status: 200, texto: frag.replace('status-producing', 'status-dispatched') });
+  await ph.painelPede('https://painel.menuintegrado.com.br/orders/cards', { method: 'GET' });
+  const lh2 = ph.postados.filter((m) => m.tipo === 'lista_pedidos').at(-1);
+  verificar('fragmento HTML: card que muda de status muda a assinatura; o outro não', lh2.itens[0].assinatura !== lh.itens[0].assinatura && lh2.itens[1].assinatura === lh.itens[1].assinatura);
+  const mesmaHora = frag.replace('19:05', '19:06');
+  ph.respostas.set('https://painel.menuintegrado.com.br/orders/cards', { status: 200, texto: mesmaHora });
+  await ph.painelPede('https://painel.menuintegrado.com.br/orders/cards', { method: 'GET' });
+  const lh3 = ph.postados.filter((m) => m.tipo === 'lista_pedidos').at(-1);
+  verificar('fragmento HTML: só o relógio mudando não muda a assinatura', lh3.itens[0].assinatura === lh.itens[0].assinatura);
+
+  // Push (formato tipo Pusher: data é JSON dentro de string)
+  const ws = ph.novoWs('wss://ws-sa1.pusher.com/app/chave123?protocol=7');
+  await ph.wsRecebe(ws, JSON.stringify({ event: 'order.updated', channel: 'private-loja', data: JSON.stringify({ order: { uuid: UUID2, code: '537421', status: 'DISPATCHED', customer: { name: 'Fulano de Tal' } } }) }));
+  const lw = ph.postados.filter((m) => m.tipo === 'lista_pedidos').at(-1);
+  verificar('WebSocket: pedido em mensagem de push vira item da lista (id e código, sem cliente)', lw?.itens?.[0]?.id === UUID2 && lw.itens[0].codigo === '537421' && !JSON.stringify(lw).includes('Fulano'), lw);
+  await ph.wsRecebe(ws, JSON.stringify({ event: 'order.html', data: JSON.stringify({ html: frag }) }));
+  const lw2 = ph.postados.filter((m) => m.tipo === 'lista_pedidos').at(-1);
+  verificar('WebSocket: HTML dentro da mensagem também é lido', lw2?.itens?.length === 2 && lw2.itens[0].incerto === true);
+  ph.rodarTimers();
+  const rotasWs = ph.postados.filter((m) => m.tipo === 'sinal_painel').at(-1)?.estado?.rotas ?? [];
+  const rw = rotasWs.find((r) => r.rota.startsWith('ws:ws-sa1.pusher.com/app/:id'));
+  verificar('WebSocket: estrutura entra no diagnóstico com o evento, sem chave/valores', rw && rw.rota.includes('#order.updated') && rw.forma.includes('order:{uuid:str,code:str,status:str,customer:{name:str}}')
+    && !JSON.stringify(rotasWs).includes('chave123') && !SENSIVEIS.some((v) => JSON.stringify(rotasWs).includes(v)), rotasWs.map((r) => r.rota));
 }
 
 // ------------------------------------------------------------------ background
@@ -222,6 +263,26 @@ function criarBackground(agoraInicial) {
   await bg.msg({ type: 'painel_presente', paginaLogin: true }, 7);
   await bg.rodada();
   verificar('aba no login: nenhuma consulta', bg.abasMsgs.length === 0);
+
+  // Id incerto (achado em HTML/push) que não é pedido: 1 consulta e descarta.
+  bg.avancar(1);
+  await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7);
+  await bg.msg({ type: 'lista_pedidos', itens: [{ id: 'dddddddd-1111-4222-8333-444455556666', assinatura: 'h1', incerto: true }] });
+  bg.abasMsgs.length = 0; bg.avancar(10); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
+  const pediuIncerto = bg.abasMsgs.some((x) => x.msg.pedidos.some((p) => p.id === 'dddddddd-1111-4222-8333-444455556666'));
+  await bg.msg({ type: 'detalhe_resultado', id: 'dddddddd-1111-4222-8333-444455556666', status: 404, reconhecido: false, motivo: 'http_404' });
+  await bg.msg({ type: 'lista_pedidos', itens: [{ id: 'dddddddd-1111-4222-8333-444455556666', assinatura: 'h2', incerto: true }] });
+  bg.abasMsgs.length = 0; bg.avancar(30); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
+  const repetiu = bg.abasMsgs.some((x) => x.msg.pedidos.some((p) => p.id === 'dddddddd-1111-4222-8333-444455556666'));
+  verificar('id incerto: consultado 1 vez; sem pedido (404) é descartado e não volta', pediuIncerto && !repetiu && bg.dados.verys_mi_sync.pedidos['dddddddd-1111-4222-8333-444455556666'].descartado === true);
+
+  // Queda de conexão: pausa curta, sem penalizar o pedido.
+  await bg.msg({ type: 'lista_pedidos', itens: [{ id: 'eeeeeeee-1111-4222-8333-444455556666', assinatura: 'q1', criadoEm: new Date(bg.agora()).toISOString() }] });
+  await bg.msg({ type: 'detalhe_resultado', id: 'eeeeeeee-1111-4222-8333-444455556666', status: 0, reconhecido: false, motivo: 'erro_rede' });
+  const pq = bg.dados.verys_mi_sync;
+  verificar('sem conexão: pausa de 1 min e o pedido não acumula falha', pq.pausaMotivo === 'sem_conexao' && (pq.pedidos['eeeeeeee-1111-4222-8333-444455556666'].falhas || 0) === 0);
+  bg.abasMsgs.length = 0; bg.avancar(1.1); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
+  verificar('conexão de volta: consulta o pedido na rodada seguinte', bg.abasMsgs.some((x) => x.msg.pedidos.some((p) => p.id === 'eeeeeeee-1111-4222-8333-444455556666')));
 
   // Resumo para o popup.
   const stats = await bg.msg({ type: 'obter_stats' });

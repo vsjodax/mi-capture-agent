@@ -385,7 +385,9 @@ const REFRESH_MIN = 4;
 const JANELA_ANDAMENTO_MS = 12 * 60 * 60 * 1000;
 const JANELA_REFRESH_MS = 6 * 60 * 60 * 1000; // = pedido_em_andamento_horas da jornada
 const PAUSA_SESSAO_MS = 10 * 60 * 1000;
-const PAUSA_SERVIDOR_MS = 5 * 60 * 1000;
+const PAUSA_LIMITE_MS = 5 * 60 * 1000; // 429
+const PAUSA_SERVIDOR_MS = 2 * 60 * 1000; // 5xx
+const PAUSA_SEM_CONEXAO_MS = 60 * 1000; // erro de rede: tenta de novo logo
 const MAX_PEDIDOS_SYNC = 400;
 
 function syncVazio() {
@@ -438,7 +440,8 @@ async function registrarLista(itens) {
     const agora = new Date().toISOString();
     for (const it of itens.slice(0, 300)) {
       if (!it || !idValido(it.id)) continue;
-      const p = sync.pedidos[it.id] || { falhas: 0 };
+      const p = sync.pedidos[it.id] || { falhas: 0, incerto: !!it.incerto };
+      if (p.descartado) continue;
       const assinatura = typeof it.assinatura === 'string' ? it.assinatura.slice(0, 32) : null;
       if (!p.listaEm || (assinatura && p.assinatura !== assinatura)) p.mudouEm = agora;
       p.assinatura = assinatura;
@@ -460,6 +463,7 @@ async function registrarDetalhe(payload) {
     const p = sync.pedidos[payload.id] || { falhas: 0 };
     p.detalheEm = new Date().toISOString();
     p.falhas = 0;
+    p.incerto = false; // detalhe de pedido confirmado
     if (typeof payload.displayId === 'string' || typeof payload.displayId === 'number') p.codigo = String(payload.displayId).slice(0, 32);
     if (typeof payload.createdAt === 'string') p.criadoEm = payload.createdAt.slice(0, 40);
     const marca = marcaDoPayload(payload);
@@ -494,14 +498,25 @@ async function registrarResultadoConsulta(msg) {
     const ok = !!msg.reconhecido;
     const p = sync.pedidos[msg.id] || { falhas: 0 };
     p.buscaEm = agora;
-    if (!ok && msg.motivo !== 'sem_modelo') p.falhas = Math.min((p.falhas || 0) + 1, 4);
+    // Falha atribuída AO PEDIDO só quando o MI respondeu e não deu para ler
+    // (404, formato). Sessão, limite, servidor e rede são pausa geral: depois
+    // de uma queda, todos voltam juntos, sem espera acumulada por pedido.
+    const geral = msg.motivo === 'sem_modelo' || msg.motivo === 'erro_rede' || status === 401 || status === 403 || status === 429 || status >= 500;
+    if (!ok && !geral) p.falhas = Math.min((p.falhas || 0) + 1, 4);
+    // Id achado só em HTML/push (incerto) cuja consulta não trouxe pedido: não
+    // é pedido — descartado, nunca mais consultado.
+    if (!ok && !geral && p.incerto) { p.final = true; p.descartado = true; }
+    if (!ok && geral && msg.motivo !== 'sem_modelo') p.buscaEm = null;
     sync.pedidos[msg.id] = p;
     if (status === 401 || status === 403) {
       sync.pausaAte = new Date(agoraMs + PAUSA_SESSAO_MS).toISOString();
       sync.pausaMotivo = 'sessao_mi';
     } else if (status === 429 || status >= 500) {
-      sync.pausaAte = new Date(agoraMs + PAUSA_SERVIDOR_MS).toISOString();
+      sync.pausaAte = new Date(agoraMs + (status === 429 ? PAUSA_LIMITE_MS : PAUSA_SERVIDOR_MS)).toISOString();
       sync.pausaMotivo = `mi_http_${status}`;
+    } else if (msg.motivo === 'erro_rede') {
+      sync.pausaAte = new Date(agoraMs + PAUSA_SEM_CONEXAO_MS).toISOString();
+      sync.pausaMotivo = 'sem_conexao';
     }
     sync.consultas = [...(sync.consultas || []), { em: agora, ok, motivo: ok ? null : (typeof msg.motivo === 'string' ? msg.motivo.slice(0, 40) : 'erro') }];
     await chrome.storage.local.set({ [STORAGE_KEYS.sync]: podarSync(sync, agoraMs) });
@@ -546,6 +561,23 @@ function agendarRodada() {
   rodadaAgendada = setTimeout(() => { rodadaAgendada = null; rodadaDeConsulta(); }, 3000);
 }
 
+// Ao iniciar: pedidos já vistos (observados, até 12 h) entram no controle da
+// consulta, para que os que ficaram parados no VERYS antes da v1.8.0 — ou que
+// já saíram da lista aberta do MI — sejam conferidos até o status final.
+async function importarObservados() {
+  await emSerie(async () => {
+    const [sync, observados] = await Promise.all([lerSync(), lerChave(STORAGE_KEYS.observados, {})]);
+    const limite = Date.now() - JANELA_ANDAMENTO_MS;
+    let novos = 0;
+    for (const [id, o] of Object.entries(observados)) {
+      if (!idValido(id) || sync.pedidos[id] || !o || Date.parse(o.vistoEm) < limite) continue;
+      sync.pedidos[id] = { falhas: 0, detalheEm: o.vistoEm, marca: o.marca ?? null };
+      novos += 1;
+    }
+    if (novos > 0) await chrome.storage.local.set({ [STORAGE_KEYS.sync]: podarSync(sync, Date.now()) });
+  });
+}
+
 async function garantirAlarmeConsulta() {
   const existente = await chrome.alarms.get(ALARME_CONSULTA);
   if (!existente) {
@@ -556,7 +588,7 @@ async function garantirAlarmeConsulta() {
 // Resumo para o sinal/popup (sem dado de cliente).
 function resumoConsulta(sync, agoraMs) {
   const consultas = (sync.consultas || []).filter((c) => Date.parse(c.em) >= agoraMs - JANELA_RESPOSTAS_MS);
-  const andamento = Object.values(sync.pedidos || {}).filter((p) => !p.final && (!p.criadoEm || Date.parse(p.criadoEm) >= agoraMs - JANELA_ANDAMENTO_MS));
+  const andamento = Object.values(sync.pedidos || {}).filter((p) => !p.final && !p.incerto && (!p.criadoEm || Date.parse(p.criadoEm) >= agoraMs - JANELA_ANDAMENTO_MS));
   const ultimaOk = consultas.filter((c) => c.ok).reduce((m, c) => (!m || c.em > m ? c.em : m), null);
   const pausada = sync.pausaAte && Date.parse(sync.pausaAte) > agoraMs;
   return {
@@ -567,7 +599,7 @@ function resumoConsulta(sync, agoraMs) {
     consultasFalha30min: consultas.filter((c) => !c.ok).length,
     ultimaConsultaOkEm: ultimaOk,
     pedidosEmAndamento: andamento.length,
-    pedidosAguardandoDetalhe: andamento.filter((p) => !p.detalheEm || (p.mudouEm && p.detalheEm < p.mudouEm)).length,
+    pedidosAguardandoDetalhe: andamento.filter((p) => !p.incerto).filter((p) => !p.detalheEm || (p.mudouEm && p.detalheEm < p.mudouEm)).length,
   };
 }
 
@@ -641,6 +673,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 (async () => {
   await garantirAlarmeSinal();
   await garantirAlarmeConsulta();
+  await importarObservados();
   const pendentes = await getPendentes();
   if (Object.keys(pendentes).length > 0) {
     await garantirAlarmeRetentativa();

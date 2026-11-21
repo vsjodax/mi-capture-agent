@@ -428,8 +428,13 @@
       }
       emitirResumosDaLista(json);
     } catch {
-      // Resposta não é JSON (HTML, imagem, etc.) — ignora silenciosamente,
-      // nunca é um erro real.
+      // Resposta não é JSON. Se for fragmento HTML do próprio MI, procura ids
+      // de pedido nos atributos (v1.8.0); qualquer outra coisa é ignorada.
+      try {
+        if (typeof texto === 'string' && ehDoMenuIntegrado(url) && pareceHtml(texto)) emitirResumosDoHtml(texto);
+      } catch {
+        // Idem.
+      }
     }
     return false;
   }
@@ -471,6 +476,8 @@
       }
       return;
     }
+    const r = resumoDaLista(v);
+    if (r) { saida.push(r); return; }
     for (const k of Object.keys(v)) coletarResumos(v[k], prof - 1, saida);
   }
 
@@ -482,6 +489,76 @@
     } catch {
       // Nunca interfere no painel.
     }
+  }
+
+  // Achado de 21/11/2026 (loja, v1.7.1): as respostas que o painel recebe
+  // sozinho não eram JSON nem HTML com componente — o diagnóstico ficou vazio.
+  // O painel pode atualizar a lista por HTML simples (fragmento) ou por
+  // WebSocket. Nesses casos, o pedido aparece como um UUID dentro de atributo
+  // (href/data-*). Esses ids saem marcados `incerto`: o service worker consulta
+  // UMA vez; se o detalhe não for de pedido, o id é descartado para sempre.
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  const ATRIBUTO_COM_UUID = /\s([\w:-]{1,40})\s*=\s*["']([^"']{0,300})["']/g;
+
+  function resumosDoHtml(html) {
+    // Ocorrências (posição, id) em ordem; cada pedido fica com o trecho entre
+    // o fim do pedido anterior e o começo do seguinte (o "card" dele).
+    const ocorrencias = [];
+    let m;
+    ATRIBUTO_COM_UUID.lastIndex = 0;
+    while ((m = ATRIBUTO_COM_UUID.exec(html)) && ocorrencias.length < 3000) {
+      const achado = m[2].match(UUID_RE);
+      if (achado) ocorrencias.push({ ini: m.index, fim: m.index + m[0].length, id: achado[0].toLowerCase() });
+    }
+    const blocos = [];
+    for (const o of ocorrencias) {
+      const ultimo = blocos[blocos.length - 1];
+      if (ultimo && ultimo.id === o.id) ultimo.fim = o.fim;
+      else blocos.push({ id: o.id, ini: o.ini, fim: o.fim });
+    }
+    const itens = new Map();
+    blocos.forEach((b, i) => {
+      if (itens.size >= 300) return;
+      const de = Math.max(i === 0 ? 0 : blocos[i - 1].fim, b.ini - 1500);
+      const ate = Math.min(i === blocos.length - 1 ? html.length : blocos[i + 1].ini, b.fim + 1500);
+      // Sem horários (o relógio do card muda sozinho). Só o hash sai daqui.
+      const trecho = html.slice(de, ate).replace(/\d{1,2}:\d{2}(:\d{2})?/g, '');
+      const anterior = itens.get(b.id);
+      itens.set(b.id, { id: b.id, codigo: null, marca: null, assinatura: hashTexto((anterior ? anterior.assinatura : '') + trecho), criadoEm: null, incerto: true });
+    });
+    return [...itens.values()];
+  }
+
+  function emitirResumosDoHtml(texto) {
+    try {
+      const itens = resumosDoHtml(texto);
+      if (itens.length > 0) window.postMessage({ channel: CHANNEL, tipo: 'lista_pedidos', itens }, '*');
+    } catch {
+      // Idem.
+    }
+  }
+
+  // Esqueleto de HTML para o diagnóstico: nomes de tags e de atributos (e
+  // quais atributos carregam UUID) — nunca texto nem valores.
+  function esqueletoHtml(html) {
+    const tags = new Set();
+    const atributos = new Map();
+    let uuids = 0;
+    for (const t of html.matchAll(/<([a-zA-Z][\w-]{0,30})/g)) { if (tags.size < 30) tags.add(t[1].toLowerCase()); }
+    ATRIBUTO_COM_UUID.lastIndex = 0;
+    let m;
+    while ((m = ATRIBUTO_COM_UUID.exec(html))) {
+      const nome = m[1].toLowerCase();
+      const comUuid = UUID_RE.test(m[2]);
+      if (comUuid) uuids += 1;
+      if (atributos.size < 40 || atributos.has(nome)) atributos.set(nome, atributos.get(nome) || comUuid);
+    }
+    const attrs = [...atributos].map(([n, u]) => (u ? `${n}(:uuid)` : n)).join(',');
+    return `htmlsimples[tags:${[...tags].join(',')};attrs:${attrs};uuids:${uuids}]`;
+  }
+
+  function pareceHtml(texto) {
+    return /^\s*</.test(texto) || /<(div|tr|li|a|span|turbo-stream|template)[\s>]/i.test(texto.slice(0, 2000));
   }
 
   // --- Consulta automática do detalhe (v1.8.0) ---
@@ -578,7 +655,7 @@
           motivo = 'erro_rede';
         }
         window.postMessage({ channel: CHANNEL, tipo: 'detalhe_resultado', id: pedido.id, status, reconhecido, motivo }, '*');
-        if (status === 401 || status === 403 || status === 429) break; // o service worker pausa
+        if (status === 401 || status === 403 || status === 429 || status >= 500 || motivo === 'erro_rede') break; // o service worker pausa
       }
     } finally {
       consultando = false;
@@ -681,12 +758,24 @@
       let forma = null;
       try { forma = formaDe(JSON.parse(texto), 4); } catch {
         if (texto.includes('data-name="')) forma = `html${componentesDe(texto)}`;
+        else if (pareceHtml(texto)) forma = esqueletoHtml(texto);
+        else if (texto.length > 0) forma = `texto[${texto.length > 1000 ? '1000+' : texto.length}]`;
       }
-      if (!forma) return; // HTML/JS/CSS comuns não interessam
-      const rota = mascararRota(url);
+      if (!forma) return;
+      registrarForma(mascararRota(url), status, forma);
+    } catch {
+      // Nunca interfere na chamada real do Menu Integrado.
+    }
+  }
+
+  function registrarForma(rota, status, forma) {
+    try {
       const atual = estruturas.get(rota);
       if (!atual && estruturas.size >= MAX_ROTAS) return;
       estruturas.set(rota, { rota, vezes: (atual?.vezes ?? 0) + 1, status: Number(status) || 0, ultimaEm: new Date().toISOString(), forma: forma.slice(0, MAX_FORMA) });
+      // Rota nova: garante que ela vá no próximo sinal do painel (o sinal da
+      // mesma resposta pode ter saído antes desta estrutura ser lida).
+      if (!atual && Number(status) >= 200 && Number(status) <= 299) agendarSinalPainel(false);
     } catch {
       // Nunca interfere na chamada real do Menu Integrado.
     }
@@ -817,4 +906,73 @@
     });
     return xhrSendOriginal.apply(this, args);
   };
+
+  // --- WebSocket (v1.8.0) ---
+  // Só OUVE as mensagens que chegam na conexão que o próprio painel abriu
+  // (nunca envia nada por ela). Serve ao diagnóstico (estrutura, sem valores)
+  // e à descoberta de pedidos novos/alterados quando a lista chega por push.
+  function textoDeMensagemJson(v, prof) {
+    // Mensagens de push costumam trazer JSON dentro de string (ex.: data).
+    if (typeof v === 'string' && prof > 0 && /^\s*[[{]/.test(v)) {
+      try { return textoDeMensagemJson(JSON.parse(v), prof - 1); } catch { return v; }
+    }
+    if (v && typeof v === 'object') {
+      const copia = Array.isArray(v) ? [] : {};
+      for (const k of Object.keys(v).slice(0, 60)) copia[k] = textoDeMensagemJson(v[k], prof);
+      return copia;
+    }
+    return v;
+  }
+
+  function coletarHtmlEmStrings(v, saida, prof) {
+    if (prof < 0 || saida.length > 20) return;
+    if (typeof v === 'string') { if (v.length > 20 && pareceHtml(v)) saida.push(v); return; }
+    if (v && typeof v === 'object') for (const k of Object.keys(v).slice(0, 60)) coletarHtmlEmStrings(v[k], saida, prof - 1);
+  }
+
+  function observarMensagemWs(urlWs, dado) {
+    try {
+      if (typeof dado !== 'string' || dado.length > 2_000_000) return;
+      let rota = 'ws';
+      try {
+        // Caminho do WebSocket: só palavras simples ficam; o resto (chave do
+        // app, canal, token) vira :id. Da consulta, só os nomes.
+        const u = new URL(urlWs);
+        const caminho = u.pathname.split('/').map((p) => (p === '' || /^[a-z]{1,12}$/i.test(p) ? p : ':id')).join('/');
+        const params = [...new Set([...u.searchParams.keys()])].filter((k) => /^[\w.-]{1,40}$/.test(k)).sort().join('&');
+        rota = `ws:${u.hostname}${caminho}${params ? `?${params}` : ''}`;
+      } catch { /* idem */ }
+      let json = null;
+      try { json = textoDeMensagemJson(JSON.parse(dado), 3); } catch { /* não-JSON */ }
+      if (json !== null) {
+        const evento = json && typeof json === 'object' && typeof json.event === 'string' ? `#${json.event.replace(/[^\w.:-]/g, '').slice(0, 60)}` : '';
+        registrarForma(`${rota}${evento}`.slice(0, 200), 200, formaDe(json, 4));
+        emitirResumosDaLista(json);
+        const htmls = [];
+        coletarHtmlEmStrings(json, htmls, 4);
+        for (const h of htmls) emitirResumosDoHtml(h);
+      } else if (pareceHtml(dado)) {
+        registrarForma(rota, 200, esqueletoHtml(dado));
+        emitirResumosDoHtml(dado);
+      }
+    } catch {
+      // Nunca interfere no painel.
+    }
+  }
+
+  const WsOriginal = window.WebSocket;
+  if (typeof WsOriginal === 'function') {
+    const WsObservado = function (...args) {
+      const ws = new WsOriginal(...args);
+      try {
+        ws.addEventListener('message', (ev) => observarMensagemWs(String(args[0] || ''), ev.data));
+      } catch {
+        // Idem.
+      }
+      return ws;
+    };
+    WsObservado.prototype = WsOriginal.prototype;
+    Object.setPrototypeOf(WsObservado, WsOriginal);
+    window.WebSocket = WsObservado;
+  }
 })();
