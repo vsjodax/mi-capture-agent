@@ -354,18 +354,25 @@ async function montarSinal(agoraMs) {
 async function enviarSinal() {
   const config = await getConfig();
   if (!config?.ingestUrl || !config?.token) return;
-  const sinal = await montarSinal(Date.now());
+  // Momento do ENVIO: a autorização de consultor conta a partir daqui (nunca
+  // da chegada da resposta) — assim ela expira antes, em tempo real, do
+  // instante em que o VERYS registrou o sinal + 3,5 min, que é o que o VERYS
+  // usa para calcular a espera de quem assume. Independe do relógio local.
+  const enviadoEm = Date.now();
+  const sinal = await montarSinal(enviadoEm);
   const resultado = await tentarEnviar(sinal, config);
   const situacao = resultado.enviado && resultado.corpo && typeof resultado.corpo.situacao === 'object' ? resultado.corpo.situacao : null;
   if (resultado.enviado && Array.isArray(resultado.corpo?.paraConferir)) {
     await registrarParaConferir(resultado.corpo.paraConferir);
     agendarRodada();
   }
-  // v1.8.3: com mais de um computador, o VERYS indica UM agente consultor e
-  // quantos agentes estão ativos (os outros só capturam o que o painel
-  // mostra). A indicação vale CONFIRMACAO_CONSULTOR_MS (3,5 min), menos que os
-  // 4 min que o VERYS espera para passar a vez a outro agente: quem perde
-  // contato para de consultar ANTES de o outro começar — nunca dois juntos.
+  // v1.8.3: o VERYS indica UM agente consultor (os outros só capturam o que o
+  // painel mostra). A autorização vale CONFIRMACAO_CONSULTOR_MS (3,5 min) a
+  // partir do envio, menos que os 4 min que o VERYS espera para passar a vez:
+  // quem perde contato para de consultar ANTES de o outro começar — nunca dois
+  // juntos. Sem resposta, ou resposta sem `consultor` (VERYS antigo, falha de
+  // leitura), nada é renovado: a autorização expira e o agente aguarda nova
+  // confirmação, mesmo sozinho.
   if (resultado.enviado && resultado.corpo && typeof resultado.corpo === 'object') {
     const { consultor, agentesAtivos } = resultado.corpo;
     if (typeof consultor === 'boolean' || (Number.isInteger(agentesAtivos) && agentesAtivos > 0)) {
@@ -382,7 +389,7 @@ async function enviarSinal() {
           }
           if (!consultor) s.consultarApos = null;
           s.consultor = consultor;
-          s.consultorAte = new Date(agora + CONFIRMACAO_CONSULTOR_MS).toISOString();
+          s.consultorAte = new Date(enviadoEm + CONFIRMACAO_CONSULTOR_MS).toISOString();
         }
         if (Number.isInteger(agentesAtivos) && agentesAtivos > 0) {
           s.agentesAtivos = agentesAtivos;
@@ -435,19 +442,26 @@ const MAX_PARA_CONFERIR = 100;
 const CONFIRMACAO_CONSULTOR_MS = 3.5 * 60 * 1000;
 const MEMORIA_AGENTES_MS = 30 * 60 * 1000;
 
-// Pode consultar o MI agora?
-//   * VERYS disse "não é você" (recente) → não;
-//   * há outros agentes ativos → só com confirmação recente de que é você;
-//   * sozinho, ou sem informação do VERYS → sim (comportamento de sempre).
+// Pode consultar o MI agora? Só com autorização de consultor VÁLIDA, em
+// qualquer caso (sozinho ou com outros computadores):
+//   * 'outro_consultor'         → VERYS disse "não é você" (recente);
+//   * 'aguardando_confirmacao'  → nunca autorizado, ou a autorização expirou
+//                                  (sem resposta do VERYS): espera o próximo sinal;
+//   * 'aguardando_troca'        → autorizado, mas a autorização do consultor
+//                                  anterior ainda pode estar valendo;
+//   * 'ok'                      → consulta.
+// Sem consulta, a captura do que o painel mostra continua; o que ficar parado
+// é recuperado pela lista "para conferir" quando a autorização voltar.
+function situacaoConsultor(sync, agoraMs) {
+  const valida = !!sync.consultorAte && Date.parse(sync.consultorAte) > agoraMs;
+  if (!valida) return 'aguardando_confirmacao';
+  if (sync.consultor !== true) return 'outro_consultor';
+  if (sync.consultarApos && Date.parse(sync.consultarApos) > agoraMs) return 'aguardando_troca';
+  return 'ok';
+}
+
 function podeConsultarAgora(sync, agoraMs) {
-  const confirmacaoValida = sync.consultorAte && Date.parse(sync.consultorAte) > agoraMs;
-  if (confirmacaoValida && sync.consultor === false) return false;
-  const variosAgentes = (sync.agentesAtivos ?? 1) > 1 && sync.agentesAtivosAte && Date.parse(sync.agentesAtivosAte) > agoraMs;
-  if (variosAgentes) {
-    const carenciaCumprida = !sync.consultarApos || Date.parse(sync.consultarApos) <= agoraMs;
-    return !!(confirmacaoValida && sync.consultor === true && carenciaCumprida);
-  }
-  return true;
+  return situacaoConsultor(sync, agoraMs) === 'ok';
 }
 
 function syncVazio() {
@@ -736,7 +750,8 @@ function resumoConsulta(sync, agoraMs) {
   const ultimaOk = consultas.filter((c) => c.ok).reduce((m, c) => (!m || c.em > m ? c.em : m), null);
   const pausada = sync.pausaAte && Date.parse(sync.pausaAte) > agoraMs;
   return {
-    outroComputadorConsulta: !podeConsultarAgora(sync, agoraMs),
+    situacaoConsultor: situacaoConsultor(sync, agoraMs),
+    outroComputadorConsulta: situacaoConsultor(sync, agoraMs) === 'outro_consultor',
     modeloAprendido: !!sync.modelo,
     pausadaAte: pausada ? sync.pausaAte : null,
     pausaMotivo: pausada ? sync.pausaMotivo : null,

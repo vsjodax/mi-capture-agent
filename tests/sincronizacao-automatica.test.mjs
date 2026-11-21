@@ -251,7 +251,10 @@ function criarBackground(agoraInicial) {
     tabs: { sendMessage: (aba, msg) => { abasMsgs.push({ aba, msg }); return Promise.resolve({ aceito: true }); } },
   };
   const sb = { chrome, console: { ...console, error: () => {}, warn: () => {} }, crypto: globalThis.crypto, setImmediate, Response, URL, Date: FakeDate, setTimeout: (fn, ms) => { api.timeouts = [...(api.timeouts || []), ms]; return 0; },
-    fetch: (url, o) => { const b = JSON.parse(o.body); enviados.push(b); return Promise.resolve(new Response(JSON.stringify(b.tipo === 'sinal_captura' ? (api.respostaSinal ?? { ok: true }) : { ok: true }), { status: 200 })); } };
+    fetch: (url, o) => { const b = JSON.parse(o.body); enviados.push(b);
+      if (b.tipo === 'sinal_captura' && api.falharSinal) return Promise.reject(new TypeError('Failed to fetch'));
+      if (b.tipo === 'sinal_captura' && api.atrasoRespostaMs) agora += api.atrasoRespostaMs;
+      return Promise.resolve(new Response(JSON.stringify(b.tipo === 'sinal_captura' ? (api.respostaSinal ?? { ok: true }) : { ok: true }), { status: 200 })); } };
   vm.createContext(sb); vm.runInContext(BACKGROUND, sb, { filename: 'background.js' });
   const msg = (m, aba = 7) => new Promise((r) => onMessage(m, { tab: { id: aba } }, r));
   return Object.assign(api, {
@@ -259,7 +262,17 @@ function criarBackground(agoraInicial) {
     async sinal() { await onAlarm({ name: 'verys_mi_sinal' }); await esperar(); },
     avancar(min) { agora += min * 60000; },
     agora: () => agora,
-    async rodada() { await onAlarm({ name: 'verys_mi_consulta' }); await esperar(); },
+    // v1.8.3: só consulta com autorização de consultor válida. Os cenários
+    // que não tratam do consultor recebem a autorização direto no storage
+    // (autoAutorizar); os de consultor desligam isso e usam o sinal real.
+    autoAutorizar: true,
+    async rodada() {
+      if (api.autoAutorizar) {
+        const s = dados.verys_mi_sync ?? { modelo: null, pausaAte: null, pausaMotivo: null, pedidos: {}, consultas: [] };
+        dados.verys_mi_sync = { ...s, consultor: true, consultorAte: new Date(agora + 3.5 * 60000).toISOString(), consultarApos: null };
+      }
+      await onAlarm({ name: 'verys_mi_consulta' }); await esperar();
+    },
   });
 }
 
@@ -393,6 +406,12 @@ function criarBackground(agoraInicial) {
   const novoPedido = async (id) => { await bg.msg({ type: 'lista_pedidos', itens: [{ id, assinatura: 'z' + bg.agora(), criadoEm: new Date(bg.agora()).toISOString() }] }); };
   const consultou = async () => { bg.abasMsgs.length = 0; await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada(); return bg.abasMsgs.length > 0; };
 
+  bg.autoAutorizar = false;
+  bg.dados.verys_mi_sync = { ...bg.dados.verys_mi_sync, consultor: undefined, consultorAte: null, consultarApos: null };
+  bg.avancar(1.1); await novoPedido('c0000000-1111-4222-8333-444455556666');
+  verificar('nunca autorizado pelo VERYS: não consulta', !(await consultou()));
+  verificar('popup: aguardando confirmação do VERYS (não "outro computador")', (await bg.msg({ type: 'obter_stats' })).consulta.situacaoConsultor === 'aguardando_confirmacao');
+
   bg.respostaSinal = R({ consultor: false, agentesAtivos: 2 }); await bg.sinal();
   bg.avancar(1.1); await novoPedido('c0000001-1111-4222-8333-444455556666');
   verificar('2 agentes, VERYS diz "não é você": não consulta', !(await consultou()));
@@ -426,15 +445,30 @@ function criarBackground(agoraInicial) {
   bg.avancar(1.5); await novoPedido('c0000011-1111-4222-8333-444455556666');
   verificar('passada a espera (2,6 min), consulta', await consultou());
 
-  // O outro computador parou: VERYS informa 1 agente ativo → consulta sem precisar de confirmação.
+  // Sozinho também: autorização expirada = aguarda nova confirmação.
   bg.respostaSinal = R({ consultor: true, agentesAtivos: 1 }); await bg.sinal();
-  bg.respostaSinal = R({}); await bg.sinal();
-  bg.avancar(10); await novoPedido('c0000004-1111-4222-8333-444455556666');
-  verificar('sozinho (1 agente ativo): consulta mesmo sem confirmação recente', await consultou());
+  bg.falharSinal = true; await bg.sinal(); await bg.sinal();
+  bg.avancar(3.4); await novoPedido('c0000004-1111-4222-8333-444455556666');
+  verificar('sozinho, VERYS fora do ar: consulta enquanto a autorização vale (3,4 min)', await consultou());
+  bg.avancar(0.2); await novoPedido('c0000005-1111-4222-8333-444455556666');
+  verificar('sozinho, VERYS fora do ar: autorização expirada (3,6 min) → para de consultar', !(await consultou()));
+  bg.avancar(40); await novoPedido('c0000006-1111-4222-8333-444455556666');
+  verificar('sozinho, VERYS fora do ar por 40 min: continua sem consultar', !(await consultou()));
+  bg.falharSinal = false;
+  bg.respostaSinal = R({ consultor: true, agentesAtivos: 1 }); await bg.sinal();
+  verificar('VERYS de volta e confirma: volta a consultar', await consultou());
 
-  // VERYS antigo (sem os campos): comportamento de sempre.
-  bg.avancar(40); await novoPedido('c0000005-1111-4222-8333-444455556666');
-  verificar('sem informação do VERYS: consulta como sempre', await consultou());
+  // VERYS antigo (resposta sem `consultor`): não renova; expira e para.
+  bg.respostaSinal = R({}); await bg.sinal();
+  bg.avancar(3.6); await novoPedido('c0000007-1111-4222-8333-444455556666');
+  verificar('VERYS sem decisão de consultor: não consulta depois que a autorização expira', !(await consultou()));
+
+  // Autorização conta do ENVIO do sinal: resposta que demora 50 s encurta a validade.
+  bg.atrasoRespostaMs = 50000;
+  const envio = bg.agora();
+  bg.respostaSinal = R({ consultor: true, agentesAtivos: 1 }); await bg.sinal();
+  bg.atrasoRespostaMs = 0;
+  verificar('autorização vale 3,5 min a partir do envio (não da chegada da resposta)', Date.parse(bg.dados.verys_mi_sync.consultorAte) === envio + 3.5 * 60000, bg.dados.verys_mi_sync.consultorAte);
 
   // Resumo para o popup.
   const stats = await bg.msg({ type: 'obter_stats' });
