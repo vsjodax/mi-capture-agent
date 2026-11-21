@@ -361,6 +361,17 @@ async function enviarSinal() {
     await registrarParaConferir(resultado.corpo.paraConferir);
     agendarRodada();
   }
+  // v1.8.2: com mais de um computador, o VERYS indica UM agente consultor
+  // (os outros só capturam o que o painel mostra — sem consulta em dobro ao
+  // MI). Sem resposta ou campo ausente: continua consultando.
+  if (resultado.enviado && typeof resultado.corpo?.consultor === 'boolean') {
+    await emSerie(async () => {
+      const s = await lerSync();
+      s.consultor = resultado.corpo.consultor;
+      s.consultorAte = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      await chrome.storage.local.set({ [STORAGE_KEYS.sync]: s });
+    });
+  }
   await chrome.storage.local.set({
     [STORAGE_KEYS.ultimoSinal]: { em: new Date().toISOString(), ok: resultado.enviado, motivo: resultado.motivo ?? null, situacao },
   });
@@ -597,7 +608,8 @@ async function rodadaDeConsulta() {
     // Limite GLOBAL: no máximo MAX_POR_RODADA consultas em qualquer janela de
     // 60 s, somando as rodadas do alarme e as disparadas pela lista (achado no
     // teste de 21/11: só o limite por rodada deixava passar 17 num minuto).
-    const pedidasNoMinuto = (sync.pedidasEm || []).filter((em) => agoraMs - Date.parse(em) < 60 * 1000).length;
+    if (sync.consultor === false && sync.consultorAte && Date.parse(sync.consultorAte) > agoraMs) return;
+    const pedidasNoMinuto =(sync.pedidasEm || []).filter((em) => agoraMs - Date.parse(em) < 60 * 1000).length;
     const vagas = MAX_POR_RODADA - pedidasNoMinuto;
     if (vagas <= 0) return;
     const pedidos = escolherConsultas(sync, agoraMs).slice(0, vagas);
@@ -656,6 +668,7 @@ function resumoConsulta(sync, agoraMs) {
   const ultimaOk = consultas.filter((c) => c.ok).reduce((m, c) => (!m || c.em > m ? c.em : m), null);
   const pausada = sync.pausaAte && Date.parse(sync.pausaAte) > agoraMs;
   return {
+    outroComputadorConsulta: sync.consultor === false && !!sync.consultorAte && Date.parse(sync.consultorAte) > agoraMs,
     modeloAprendido: !!sync.modelo,
     pausadaAte: pausada ? sync.pausaAte : null,
     pausaMotivo: pausada ? sync.pausaMotivo : null,

@@ -395,6 +395,9 @@ async function rodarCenarios() {
       + '<tr><td><small>Entregue</small></td><td class="pl-2">19:02</td></tr></table>';
     const extra = {
       createdAt: '2026-11-19T18:00:00.000-03:00',
+      // Pedido entregue: o MI traz o horário completo da entrega (v1.8.2 usa
+      // como fonte exata do "Entregue" e como limite da janela das etapas).
+      deliveredAt: '2026-11-19T19:02:00.000-03:00',
       payments: [{ methodLabel: 'Dinheiro', provider: { sku: 'delivery' }, needsChange: true, changeFor: 100 }],
       missingPayment: true,
       street: 'Rua das Flores', number: '120', complement: 'Apto 3', neighborhood: 'Velha', reference: 'Perto da praça', city: 'Blumenau',

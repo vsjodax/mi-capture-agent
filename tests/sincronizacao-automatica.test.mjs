@@ -369,6 +369,21 @@ function criarBackground(agoraInicial) {
   bg.abasMsgs.length = 0; bg.avancar(5); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
   verificar('depois de conferido (entregue), não repete mesmo se o VERYS ainda listar por alguns minutos', !bg.abasMsgs.some((x) => x.msg.pedidos.some((p) => p.id === VELHO)));
 
+  // Dois computadores: o VERYS indica o consultor; o outro não consulta.
+  bg.respostaSinal = { ok: true, situacao: { comprovada: false, lojas: [] }, paraConferir: [{ id: 'abababab-1111-4222-8333-444455556666' }], consultor: false };
+  await bg.sinal();
+  bg.abasMsgs.length = 0; bg.avancar(2); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
+  verificar('consultor=false: este agente não consulta (outro computador consulta)', bg.abasMsgs.length === 0);
+  bg.respostaSinal = { ok: true, situacao: { comprovada: false, lojas: [] }, paraConferir: [{ id: 'abababab-1111-4222-8333-444455556666' }], consultor: true };
+  await bg.sinal();
+  bg.abasMsgs.length = 0; await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
+  verificar('consultor=true: volta a consultar', bg.abasMsgs.some((x) => x.msg.pedidos.some((p) => p.id === 'abababab-1111-4222-8333-444455556666')));
+  bg.respostaSinal = { ok: true, situacao: { comprovada: false, lojas: [] }, consultor: false };
+  await bg.sinal();
+  bg.avancar(6); await bg.msg({ type: 'lista_pedidos', itens: [{ id: 'cdcdcdcd-1111-4222-8333-444455556666', assinatura: 'z', criadoEm: new Date(bg.agora()).toISOString() }] });
+  bg.abasMsgs.length = 0; await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
+  verificar('sem resposta do VERYS há mais de 5 min, a indicação expira e o agente volta a consultar', bg.abasMsgs.length === 1);
+
   // Resumo para o popup.
   const stats = await bg.msg({ type: 'obter_stats' });
   verificar('popup recebe o resumo da consulta automática', stats.consulta && stats.consulta.modeloAprendido === true && typeof stats.consulta.consultasOk30min === 'number', stats.consulta);
