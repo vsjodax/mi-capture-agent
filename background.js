@@ -18,6 +18,9 @@ const STORAGE_KEYS = {
   painel: 'verys_mi_painel', // { abas: {[tabId]: {vistoEm, paginaLogin}}, ultimaRespostaOkEm, ultimaFalhaSessaoEm, respostasOk: [{em, n}] }
   observados: 'verys_mi_observados', // { [idPedidoMi]: { vistoEm, marca } } — últimas 24 h, só id e marca
   ultimoSinal: 'verys_mi_ultimo_sinal', // { em, ok, motivo, situacao (resposta do VERYS) }
+  // v1.8.0 — consulta automática do detalhe (ver escolherConsultas):
+  // { modelo, pausaAte, pausaMotivo, pedidos: {[id]: {...}}, consultas: [{em, ok, motivo}] }
+  sync: 'verys_mi_sync',
 };
 
 const ALARME_RETENTATIVA = 'verys_mi_retry_pendentes';
@@ -354,9 +357,303 @@ async function enviarSinal() {
   const sinal = await montarSinal(Date.now());
   const resultado = await tentarEnviar(sinal, config);
   const situacao = resultado.enviado && resultado.corpo && typeof resultado.corpo.situacao === 'object' ? resultado.corpo.situacao : null;
+  if (resultado.enviado && Array.isArray(resultado.corpo?.paraConferir)) {
+    await registrarParaConferir(resultado.corpo.paraConferir);
+    agendarRodada();
+  }
   await chrome.storage.local.set({
     [STORAGE_KEYS.ultimoSinal]: { em: new Date().toISOString(), ok: resultado.enviado, motivo: resultado.motivo ?? null, situacao },
   });
+}
+
+// ---------------------------------------------------------------------------
+// v1.8.0 — Consulta automática do detalhe (sincronização sem abrir o pedido)
+// ---------------------------------------------------------------------------
+// Achado de 20/11/2026: com o painel aberto e sem interação, nenhum pedido
+// novo nem mudança (status, motoboy, pagamento) chegava ao VERYS — só o
+// DETALHE traz o pedido completo, e ele só era carregado quando alguém abria
+// o pedido. Agora o service worker pede ao painel (aba logada) a consulta de
+// LEITURA do detalhe dos pedidos em andamento, com frequência controlada:
+//   * pedido novo na lista, ou que mudou na lista → consulta já;
+//   * pedido em andamento sem consulta há REFRESH_MIN → consulta de novo
+//     (motoboy/pagamento podem mudar sem a lista mudar);
+//   * entregue/cancelado já consultado → para de consultar;
+//   * no máximo MAX_POR_RODADA por minuto (o painel espaça 2,5 s entre elas);
+//   * 401/403 (sessão) → pausa 10 min; 429/5xx → pausa 5 min; falha de um
+//     pedido → espera 2^n min (até 16) para tentar ele de novo.
+// Nunca altera pedido: só GET no endereço de detalhe que o próprio painel usa.
+const ALARME_CONSULTA = 'verys_mi_consulta';
+const INTERVALO_CONSULTA_MINUTOS = 1;
+const MAX_POR_RODADA = 6;
+const REFRESH_MIN = 4;
+const JANELA_ANDAMENTO_MS = 12 * 60 * 60 * 1000;
+const JANELA_REFRESH_MS = 6 * 60 * 60 * 1000; // = pedido_em_andamento_horas da jornada
+const PAUSA_SESSAO_MS = 10 * 60 * 1000;
+const PAUSA_LIMITE_MS = 5 * 60 * 1000; // 429
+const PAUSA_SERVIDOR_MS = 2 * 60 * 1000; // 5xx
+const PAUSA_SEM_CONEXAO_MS = 60 * 1000; // erro de rede: tenta de novo logo
+const MAX_PEDIDOS_SYNC = 400;
+const MAX_INCERTOS_POR_RODADA = 2;
+// Pedidos que o VERYS pede para conferir (em andamento lá, sem sincronizar):
+// consultados mesmo fora das janelas acima — é a recuperação depois de queda.
+const JANELA_CONFERIR_MS = 72 * 60 * 60 * 1000;
+const RECONFERIR_MS = 15 * 60 * 1000;
+const MAX_PARA_CONFERIR = 100;
+
+function syncVazio() {
+  return { modelo: null, pausaAte: null, pausaMotivo: null, pedidos: {}, consultas: [] };
+}
+
+const idValido = (id) => typeof id === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(id);
+
+function podarSync(sync, agoraMs) {
+  const limite = agoraMs - JANELA_ANDAMENTO_MS;
+  const recente = (p) => [p.listaEm, p.detalheEm, p.criadoEm].some((t) => t && Date.parse(t) >= limite)
+    || (p.conferirEm && Date.parse(p.conferirEm) >= agoraMs - JANELA_CONFERIR_MS);
+  const vivos = Object.entries(sync.pedidos || {})
+    .filter(([, p]) => recente(p))
+    .sort((a, b) => ((a[1].listaEm || a[1].detalheEm || '') < (b[1].listaEm || b[1].detalheEm || '') ? 1 : -1))
+    .slice(0, MAX_PEDIDOS_SYNC);
+  sync.pedidos = Object.fromEntries(vivos);
+  sync.consultas = (sync.consultas || []).filter((c) => Date.parse(c.em) >= agoraMs - JANELA_RESPOSTAS_MS).slice(-200);
+  return sync;
+}
+
+// Função pura: quais pedidos consultar agora (mais urgentes primeiro).
+function escolherConsultas(sync, agoraMs) {
+  if (sync.pausaAte && Date.parse(sync.pausaAte) > agoraMs) return [];
+  const limite = agoraMs - JANELA_ANDAMENTO_MS;
+  const candidatos = [];
+  for (const [id, p] of Object.entries(sync.pedidos || {})) {
+    if (p.final) continue;
+    const espera = p.falhas > 0 ? Math.min(2 ** p.falhas, 16) * 60 * 1000 : 0;
+    if (p.buscaEm && agoraMs - Date.parse(p.buscaEm) < Math.max(espera, 60 * 1000)) continue;
+    // Pedido que o VERYS pediu para conferir e ainda não foi consultado depois
+    // do pedido: vai na frente, sem limite de idade.
+    if (p.conferirEm && (!p.detalheEm || p.detalheEm < p.conferirEm)) {
+      candidatos.push({ id, codigo: p.codigo ?? null, prioridade: 0, ref: p.conferirEm, incerto: false });
+      continue;
+    }
+    if (p.criadoEm && Date.parse(p.criadoEm) < limite) continue;
+    const semDetalhe = !p.detalheEm;
+    const mudou = p.mudouEm && (!p.detalheEm || p.detalheEm < p.mudouEm);
+    const velho = p.detalheEm && agoraMs - Date.parse(p.detalheEm) >= REFRESH_MIN * 60 * 1000
+      && (!p.criadoEm || Date.parse(p.criadoEm) >= agoraMs - JANELA_REFRESH_MS);
+    if (semDetalhe || mudou) candidatos.push({ id, codigo: p.codigo ?? null, prioridade: 0, ref: p.mudouEm || p.listaEm || '', incerto: !!p.incerto });
+    else if (velho) candidatos.push({ id, codigo: p.codigo ?? null, prioridade: 1, ref: p.detalheEm, incerto: !!p.incerto });
+  }
+  // Confirmados antes dos incertos (achados só em HTML/push); no máximo
+  // MAX_INCERTOS_POR_RODADA incertos por rodada.
+  candidatos.sort((a, b) => a.prioridade - b.prioridade || Number(a.incerto) - Number(b.incerto) || (a.prioridade === 0 ? (a.ref < b.ref ? 1 : -1) : (a.ref < b.ref ? -1 : 1)));
+  const escolhidos = [];
+  let incertos = 0;
+  for (const c of candidatos) {
+    if (escolhidos.length >= MAX_POR_RODADA) break;
+    if (c.incerto && incertos >= MAX_INCERTOS_POR_RODADA) continue;
+    if (c.incerto) incertos += 1;
+    escolhidos.push({ id: c.id, codigo: c.codigo });
+  }
+  return escolhidos;
+}
+
+async function lerSync() {
+  return lerChave(STORAGE_KEYS.sync, syncVazio());
+}
+
+async function registrarLista(itens) {
+  if (!Array.isArray(itens)) return;
+  await emSerie(async () => {
+    const sync = await lerSync();
+    const agora = new Date().toISOString();
+    for (const it of itens.slice(0, 300)) {
+      if (!it || !idValido(it.id)) continue;
+      const p = sync.pedidos[it.id] || { falhas: 0, incerto: !!it.incerto };
+      if (p.descartado) continue;
+      const assinatura = typeof it.assinatura === 'string' ? it.assinatura.slice(0, 32) : null;
+      if (!p.listaEm || (assinatura && p.assinatura !== assinatura)) p.mudouEm = agora;
+      p.assinatura = assinatura;
+      p.listaEm = agora;
+      if (typeof it.codigo === 'string') p.codigo = it.codigo.slice(0, 32);
+      if (typeof it.marca === 'string') p.marca = it.marca.slice(0, 120);
+      if (typeof it.criadoEm === 'string' && !p.criadoEm) p.criadoEm = it.criadoEm.slice(0, 40);
+      sync.pedidos[it.id] = p;
+    }
+    await chrome.storage.local.set({ [STORAGE_KEYS.sync]: podarSync(sync, Date.now()) });
+  });
+}
+
+// Pedido completo recebido (do painel ou da consulta): conta como detalhe.
+async function registrarDetalhe(payload) {
+  if (!payload || !idValido(payload.id)) return;
+  await emSerie(async () => {
+    const sync = await lerSync();
+    const p = sync.pedidos[payload.id] || { falhas: 0 };
+    p.detalheEm = new Date().toISOString();
+    p.falhas = 0;
+    p.incerto = false; // detalhe de pedido confirmado
+    if (typeof payload.displayId === 'string' || typeof payload.displayId === 'number') p.codigo = String(payload.displayId).slice(0, 32);
+    if (typeof payload.createdAt === 'string') p.criadoEm = payload.createdAt.slice(0, 40);
+    const marca = marcaDoPayload(payload);
+    if (marca) p.marca = marca;
+    const entregue = Array.isArray(payload.statusHistory) && payload.statusHistory.some((h) => h && h.status === 'Entregue');
+    p.final = !!payload.cancelled || entregue;
+    sync.pedidos[payload.id] = p;
+    await chrome.storage.local.set({ [STORAGE_KEYS.sync]: podarSync(sync, Date.now()) });
+  });
+}
+
+// Lista que o VERYS devolve na resposta do sinal: pedidos em andamento lá sem
+// sincronização recente (ex.: os que ficaram parados numa queda). Só ids do MI.
+async function registrarParaConferir(lista) {
+  if (!Array.isArray(lista) || lista.length === 0) return;
+  await emSerie(async () => {
+    const sync = await lerSync();
+    const agoraMs = Date.now();
+    const agora = new Date(agoraMs).toISOString();
+    for (const item of lista.slice(0, MAX_PARA_CONFERIR)) {
+      const id = typeof item === 'string' ? item : item?.id;
+      if (!idValido(id)) continue;
+      const p = sync.pedidos[id] || { falhas: 0 };
+      if (p.descartado) continue;
+      const jaConferido = p.detalheEm && (!p.conferirEm || p.detalheEm >= p.conferirEm);
+      if (!p.conferirEm || (jaConferido && agoraMs - Date.parse(p.detalheEm) >= RECONFERIR_MS)) {
+        p.conferirEm = agora;
+        p.final = false;
+      }
+      p.incerto = false;
+      if (typeof item?.marca === 'string') p.marca = item.marca.slice(0, 120);
+      sync.pedidos[id] = p;
+    }
+    await chrome.storage.local.set({ [STORAGE_KEYS.sync]: podarSync(sync, agoraMs) });
+  });
+}
+
+async function registrarModelo(modelo) {
+  if (!modelo || typeof modelo.url !== 'string' || !['uuid', 'code'].includes(modelo.campo)) return;
+  let u;
+  try { u = new URL(modelo.url.split('{id}').join('x')); } catch { return; }
+  const host = u.hostname;
+  if (!(host === 'menuintegrado.com.br' || host.endsWith('.menuintegrado.com.br')) || !modelo.url.includes('{id}')) return;
+  await emSerie(async () => {
+    const sync = await lerSync();
+    sync.modelo = { url: modelo.url.slice(0, 300), campo: modelo.campo, aprendidoEm: new Date().toISOString() };
+    await chrome.storage.local.set({ [STORAGE_KEYS.sync]: sync });
+  });
+}
+
+async function registrarResultadoConsulta(msg) {
+  if (!msg || !idValido(msg.id)) return;
+  await emSerie(async () => {
+    const sync = await lerSync();
+    const agoraMs = Date.now();
+    const agora = new Date(agoraMs).toISOString();
+    const status = Number(msg.status) || 0;
+    const ok = !!msg.reconhecido;
+    const p = sync.pedidos[msg.id] || { falhas: 0 };
+    p.buscaEm = agora;
+    // Falha atribuída AO PEDIDO só quando o MI respondeu e não deu para ler
+    // (404, formato). Sessão, limite, servidor e rede são pausa geral: depois
+    // de uma queda, todos voltam juntos, sem espera acumulada por pedido.
+    const geral = msg.motivo === 'sem_modelo' || msg.motivo === 'erro_rede' || status === 401 || status === 403 || status === 429 || status >= 500;
+    if (!ok && !geral) p.falhas = Math.min((p.falhas || 0) + 1, 4);
+    // Id achado só em HTML/push (incerto) cuja consulta não trouxe pedido: não
+    // é pedido — descartado, nunca mais consultado.
+    if (!ok && !geral && p.incerto) { p.final = true; p.descartado = true; }
+    if (!ok && geral && msg.motivo !== 'sem_modelo') p.buscaEm = null;
+    sync.pedidos[msg.id] = p;
+    if (status === 401 || status === 403) {
+      sync.pausaAte = new Date(agoraMs + PAUSA_SESSAO_MS).toISOString();
+      sync.pausaMotivo = 'sessao_mi';
+    } else if (status === 429 || status >= 500) {
+      sync.pausaAte = new Date(agoraMs + (status === 429 ? PAUSA_LIMITE_MS : PAUSA_SERVIDOR_MS)).toISOString();
+      sync.pausaMotivo = `mi_http_${status}`;
+    } else if (msg.motivo === 'erro_rede') {
+      sync.pausaAte = new Date(agoraMs + PAUSA_SEM_CONEXAO_MS).toISOString();
+      sync.pausaMotivo = 'sem_conexao';
+    }
+    sync.consultas = [...(sync.consultas || []), { em: agora, ok, motivo: ok ? null : (typeof msg.motivo === 'string' ? msg.motivo.slice(0, 40) : 'erro') }];
+    await chrome.storage.local.set({ [STORAGE_KEYS.sync]: podarSync(sync, agoraMs) });
+  });
+}
+
+// Aba do painel para fazer a consulta: a vista mais recentemente, fora do login.
+function escolherAba(painel, agoraMs) {
+  const abas = Object.entries(painel.abas || {})
+    .filter(([, a]) => !a.paginaLogin && agoraMs - Date.parse(a.vistoEm) <= ABA_PRESENTE_MS)
+    .sort((a, b) => (a[1].vistoEm < b[1].vistoEm ? 1 : -1));
+  return abas.length ? Number(abas[0][0]) : null;
+}
+
+let rodadaEmAndamento = false;
+async function rodadaDeConsulta() {
+  if (rodadaEmAndamento || !chrome.tabs?.sendMessage) return;
+  rodadaEmAndamento = true;
+  try {
+    const agoraMs = Date.now();
+    const [sync, painel] = await Promise.all([lerSync(), lerChave(STORAGE_KEYS.painel, painelVazio())]);
+    const pedidos = escolherConsultas(sync, agoraMs);
+    if (pedidos.length === 0) return;
+    const aba = escolherAba(painel, agoraMs);
+    if (aba == null || Number.isNaN(aba)) return;
+    // Marca como "em consulta" antes de pedir, para a próxima rodada não
+    // repetir o mesmo pedido se a resposta demorar.
+    await emSerie(async () => {
+      const s = await lerSync();
+      for (const { id } of pedidos) if (s.pedidos[id]) s.pedidos[id].buscaEm = new Date(agoraMs).toISOString();
+      await chrome.storage.local.set({ [STORAGE_KEYS.sync]: s });
+    });
+    await chrome.tabs.sendMessage(aba, { type: 'buscar_detalhes', pedidos, modelo: sync.modelo ?? null }).catch(() => {});
+  } finally {
+    rodadaEmAndamento = false;
+  }
+}
+
+let rodadaAgendada = null;
+function agendarRodada() {
+  if (rodadaAgendada) return;
+  rodadaAgendada = setTimeout(() => { rodadaAgendada = null; rodadaDeConsulta(); }, 3000);
+}
+
+// Ao iniciar: pedidos já vistos (observados, até 12 h) entram no controle da
+// consulta, para que os que ficaram parados no VERYS antes da v1.8.0 — ou que
+// já saíram da lista aberta do MI — sejam conferidos até o status final.
+async function importarObservados() {
+  await emSerie(async () => {
+    const [sync, observados] = await Promise.all([lerSync(), lerChave(STORAGE_KEYS.observados, {})]);
+    const limite = Date.now() - JANELA_ANDAMENTO_MS;
+    let novos = 0;
+    for (const [id, o] of Object.entries(observados)) {
+      if (!idValido(id) || sync.pedidos[id] || !o || Date.parse(o.vistoEm) < limite) continue;
+      sync.pedidos[id] = { falhas: 0, detalheEm: o.vistoEm, marca: o.marca ?? null };
+      novos += 1;
+    }
+    if (novos > 0) await chrome.storage.local.set({ [STORAGE_KEYS.sync]: podarSync(sync, Date.now()) });
+  });
+}
+
+async function garantirAlarmeConsulta() {
+  const existente = await chrome.alarms.get(ALARME_CONSULTA);
+  if (!existente) {
+    chrome.alarms.create(ALARME_CONSULTA, { periodInMinutes: INTERVALO_CONSULTA_MINUTOS });
+  }
+}
+
+// Resumo para o sinal/popup (sem dado de cliente).
+function resumoConsulta(sync, agoraMs) {
+  const consultas = (sync.consultas || []).filter((c) => Date.parse(c.em) >= agoraMs - JANELA_RESPOSTAS_MS);
+  const andamento = Object.values(sync.pedidos || {}).filter((p) => !p.final && !p.incerto && (!p.criadoEm || Date.parse(p.criadoEm) >= agoraMs - JANELA_ANDAMENTO_MS));
+  const ultimaOk = consultas.filter((c) => c.ok).reduce((m, c) => (!m || c.em > m ? c.em : m), null);
+  const pausada = sync.pausaAte && Date.parse(sync.pausaAte) > agoraMs;
+  return {
+    modeloAprendido: !!sync.modelo,
+    pausadaAte: pausada ? sync.pausaAte : null,
+    pausaMotivo: pausada ? sync.pausaMotivo : null,
+    consultasOk30min: consultas.filter((c) => c.ok).length,
+    consultasFalha30min: consultas.filter((c) => !c.ok).length,
+    ultimaConsultaOkEm: ultimaOk,
+    pedidosEmAndamento: andamento.length,
+    pedidosAguardandoDetalhe: andamento.filter((p) => !p.incerto).filter((p) => !p.detalheEm || (p.mudouEm && p.detalheEm < p.mudouEm)).length,
+  };
 }
 
 async function garantirAlarmeSinal() {
@@ -373,11 +670,15 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARME_SINAL) {
     enviarSinal();
   }
+  if (alarm.name === ALARME_CONSULTA) {
+    rodadaDeConsulta();
+  }
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'pedido_observado') {
     registrarObservado(message.payload)
+      .then(() => registrarDetalhe(message.payload))
       .then(() => enviarParaIngest(message.payload))
       .then(() => sendResponse({ ok: true }));
     return true; // resposta assíncrona
@@ -393,10 +694,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === 'lista_pedidos') {
+    registrarLista(message.itens).then(() => { agendarRodada(); sendResponse({ ok: true }); });
+    return true;
+  }
+
+  if (message?.type === 'modelo_detalhe') {
+    registrarModelo(message.modelo).then(() => { agendarRodada(); sendResponse({ ok: true }); });
+    return true;
+  }
+
+  if (message?.type === 'detalhe_resultado') {
+    registrarResultadoConsulta(message).then(() => sendResponse({ ok: true }));
+    return true;
+  }
+
   if (message?.type === 'obter_stats') {
-    Promise.all([getStats(), getPendentes(), montarSinal(Date.now()), lerChave(STORAGE_KEYS.ultimoSinal, null)])
-      .then(([stats, pendentes, sinal, ultimoSinal]) => {
-        sendResponse({ ...stats, pendentes: Object.keys(pendentes).length, painel: sinal.painel, ultimoSinal });
+    Promise.all([getStats(), getPendentes(), montarSinal(Date.now()), lerChave(STORAGE_KEYS.ultimoSinal, null), lerSync()])
+      .then(([stats, pendentes, sinal, ultimoSinal, sync]) => {
+        sendResponse({ ...stats, pendentes: Object.keys(pendentes).length, painel: sinal.painel, ultimoSinal, consulta: resumoConsulta(sync, Date.now()) });
       });
     return true;
   }
@@ -409,6 +725,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // tenta reprocessar qualquer pendência que tenha sobrado de antes.
 (async () => {
   await garantirAlarmeSinal();
+  await garantirAlarmeConsulta();
+  await importarObservados();
   const pendentes = await getPendentes();
   if (Object.keys(pendentes).length > 0) {
     await garantirAlarmeRetentativa();

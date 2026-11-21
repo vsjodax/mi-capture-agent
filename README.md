@@ -172,3 +172,26 @@ e o resultado do último sinal.
 - `popup.html`/`popup.js` — status em tempo real.
 - `options.html`/`options.js` — configuração (URL do Menu Integrado,
   endpoint, token).
+
+## v1.8.0 — sincronização sem abrir o pedido
+
+Até a v1.7.x o pedido só chegava ao VERYS quando alguém abria o detalhe no
+painel. A v1.8.0 faz **consulta de leitura** do detalhe, usando a sessão já
+aberta do painel:
+
+- **Só GET**, no mesmo endereço de detalhe que o próprio painel usa (aprendido
+  da primeira vez que um detalhe é aberto; guardado só se não tiver token).
+  Os cabeçalhos de sessão ficam apenas na memória da página do MI.
+- **O que é consultado:** pedido novo ou alterado na lista do painel (JSON,
+  fragmento HTML ou WebSocket — só objetos com cara de pedido ou atributos
+  `data-order-*` / links `/orders/<uuid>`), pedidos em andamento a cada 4 min,
+  e os pedidos que o **VERYS** pede para conferir na resposta do sinal
+  (`paraConferir`: em andamento lá e sem sincronização há mais de 20 min, até
+  72 h — recuperação depois de queda).
+- **Frequência:** até 6 consultas por minuto (no máximo 2 de ids incertos),
+  2,5 s entre elas; pausa 10 min em 401/403, 5 min em 429, 2 min em 5xx e
+  1 min sem conexão. Entregue/cancelado para de ser consultado.
+- **Popup:** "Painel conectado" separado de "Pedidos sincronizados".
+
+Retorno à versão anterior: extrair o pacote da v1.7.1 por cima da mesma pasta
+e recarregar a extensão (as configurações ficam).

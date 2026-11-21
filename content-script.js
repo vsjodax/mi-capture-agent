@@ -27,8 +27,40 @@
       return;
     }
 
+    // v1.8.0: lista (só id/código/marca/assinatura), modelo do endereço de
+    // detalhe (sem token) e resultado de cada consulta automática.
+    if (event.data.tipo === 'lista_pedidos') {
+      repassar({ type: 'lista_pedidos', itens: event.data.itens });
+      return;
+    }
+    if (event.data.tipo === 'modelo_detalhe') {
+      repassar({ type: 'modelo_detalhe', modelo: event.data.modelo });
+      return;
+    }
+    if (event.data.tipo === 'detalhe_resultado') {
+      const { id, status, reconhecido, motivo } = event.data;
+      repassar({ type: 'detalhe_resultado', id, status, reconhecido, motivo });
+      return;
+    }
+    // Mensagem que este próprio script manda ao page-hook — não é pedido.
+    if (event.data.tipo === 'buscar_detalhes') return;
+
+    if (!event.data.payload) return;
     repassar({ type: 'pedido_observado', payload: event.data.payload });
   });
+
+  // v1.8.0: o service worker escolhe quais detalhes consultar (e quando);
+  // aqui só repassa ao page-hook, que faz a consulta de leitura no painel.
+  try {
+    chrome.runtime.onMessage.addListener((mensagem, _remetente, responder) => {
+      if (mensagem?.type !== 'buscar_detalhes' || !Array.isArray(mensagem.pedidos)) return false;
+      window.postMessage({ channel: CHANNEL, tipo: 'buscar_detalhes', pedidos: mensagem.pedidos, modelo: mensagem.modelo ?? null }, '*');
+      responder({ aceito: true });
+      return false;
+    });
+  } catch {
+    // Contexto da extensão invalidado (extensão recarregada): nada a fazer.
+  }
 
   // v1.7.0: presença da aba do painel (a cada minuto). Diz só se a aba está
   // aberta e se está na tela de login do MI (sessão caída), lendo a própria

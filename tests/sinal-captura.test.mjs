@@ -285,7 +285,7 @@ function testarPopup() {
   const agora = Date.parse('2026-11-20T18:00:00.000Z');
   const em = (min) => new Date(agora - min * 60000).toISOString();
   const d = (s) => ctx.descreverSincronizacao(s, agora);
-  verificar('popup: sem sinal enviado = NÃO comprovada', d(null).comprovada === false && /NÃO comprovada/.test(d(null).titulo));
+  verificar('popup: sem sinal enviado = NÃO comprovado', d(null).comprovada === false && /NÃO comprovado/.test(d(null).titulo));
   verificar('popup: sinal recusado = NÃO comprovada, com o motivo', d({ em: em(1), ok: false, motivo: 'http_401' }).comprovada === false
     && d({ em: em(1), ok: false, motivo: 'http_401' }).detalhes[0].includes('http_401'));
   verificar('popup: sinal antigo (> 5 min) = NÃO comprovada, mesmo se o VERYS tinha comprovado',
@@ -295,7 +295,7 @@ function testarPopup() {
   verificar('popup: motivo por loja aparece por extenso, só nas lojas com problema', pend.comprovada === false && pend.detalhes.length === 1
     && pend.detalhes[0] === 'HiperChef Pizza Premium: há pedido com atualização ainda não sincronizada', pend.detalhes);
   const ok = d({ em: em(1), ok: true, situacao: { comprovada: true, lojas: [{ loja: 'Pizza', motivo: null }] } });
-  verificar('popup: só diz comprovada quando o VERYS comprovou num sinal recente', ok.comprovada === true && /comprovada pelo VERYS/.test(ok.titulo));
+  verificar('popup: só diz comprovada quando o VERYS comprovou num sinal recente', ok.comprovada === true && /comprovado pelo VERYS/.test(ok.titulo));
 }
 
 await testarBackground();
