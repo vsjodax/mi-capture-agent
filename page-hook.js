@@ -454,11 +454,20 @@
     return (h >>> 0).toString(36);
   }
 
+  // Restrito a objetos com cara de PEDIDO do MI: `uuid` + `code` (o "#537420")
+  // + ao menos 2 marcas de pedido (as mesmas chaves do pedido real, ver
+  // _debugMotoboy.todasAsChaves). Cliente, motoboy, item ou produto (que
+  // também têm uuid) não passam — nunca viram consulta.
+  const MARCAS_DE_PEDIDO = ['rootResource', 'channel', 'createdAt', 'customer', 'subtotal', 'total', 'items', 'statusMessage', 'deliveryMethod', 'productChannel', 'cancelled'];
+
   function resumoDaLista(item) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
-    if (typeof item.uuid !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(item.uuid)) return null;
+    if (typeof item.uuid !== 'string' || !UUID_RE.test(item.uuid) || item.uuid.length !== 36) return null;
+    if (!(typeof item.code === 'string' || typeof item.code === 'number') || !/^\d{3,12}$/.test(String(item.code))) return null;
     const chaves = Object.keys(item).filter((k) => CHAVE_ANDAMENTO.test(k)).sort();
-    if (item.code === undefined && chaves.length === 0) return null;
+    const marcas = MARCAS_DE_PEDIDO.filter((k) => item[k] !== undefined).length;
+    const statusComDono = chaves.some((k) => /status/i.test(k)) && (typeof item.customer === 'object' || typeof item.rootResource === 'object');
+    if (marcas < 2 && !statusComDono) return null;
     const assinatura = hashTexto(JSON.stringify(chaves.map((k) => [k, item[k]])));
     const codigo = typeof item.code === 'string' || typeof item.code === 'number' ? String(item.code).slice(0, 32) : null;
     const marca = typeof item.rootResource?.slug === 'string' ? item.rootResource.slug.slice(0, 120) : null;
@@ -500,6 +509,23 @@
   const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   const ATRIBUTO_COM_UUID = /\s([\w:-]{1,40})\s*=\s*["']([^"']{0,300})["']/g;
 
+  // Só aceita UUID em atributo que diga que é PEDIDO: nome com order/pedido
+  // (data-order-id, data-order-uuid…) cujo valor é só o UUID, ou link/rota
+  // .../orders/<uuid> ou .../pedidos/<uuid>. UUID de cliente, produto, loja,
+  // imagem ou qualquer outro atributo é ignorado — nunca vira consulta.
+  const ROTA_DE_PEDIDO = /\/(orders?|pedidos?)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=$|[/?#])/i;
+  const NOME_DE_PEDIDO = /^data-(order|pedido)[\w-]*$/i;
+
+  function idDePedidoNoAtributo(nome, valor) {
+    const v = valor.trim();
+    if (NOME_DE_PEDIDO.test(nome) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) return v.toLowerCase();
+    if (/^(href|data-[\w-]*(url|href|link|path)[\w-]*|action)$/i.test(nome)) {
+      const r = v.match(ROTA_DE_PEDIDO);
+      if (r) return r[2].toLowerCase();
+    }
+    return null;
+  }
+
   function resumosDoHtml(html) {
     // Ocorrências (posição, id) em ordem; cada pedido fica com o trecho entre
     // o fim do pedido anterior e o começo do seguinte (o "card" dele).
@@ -507,8 +533,8 @@
     let m;
     ATRIBUTO_COM_UUID.lastIndex = 0;
     while ((m = ATRIBUTO_COM_UUID.exec(html)) && ocorrencias.length < 3000) {
-      const achado = m[2].match(UUID_RE);
-      if (achado) ocorrencias.push({ ini: m.index, fim: m.index + m[0].length, id: achado[0].toLowerCase() });
+      const id = idDePedidoNoAtributo(m[1], m[2]);
+      if (id) ocorrencias.push({ ini: m.index, fim: m.index + m[0].length, id });
     }
     const blocos = [];
     for (const o of ocorrencias) {

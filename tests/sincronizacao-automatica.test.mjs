@@ -133,12 +133,17 @@ function criarPageHook() {
   // 7) Lista: só id/código/marca/assinatura.
   const lista = { data: { orders: [
     { uuid: UUID, code: '537420', status: 'PRODUCING', createdAt: '2026-11-20T22:00:00.000Z', rootResource: { slug: 'hiperchefpizza' }, customer: { name: 'Fulano de Tal', mobilePhone: '47999998888' }, street: 'Rua das Flores' },
-    { uuid: UUID2, code: '537421', status: 'DISPATCHED', motoboy: { name: 'Motoboy Teste' } },
+    { uuid: UUID2, code: '537421', status: 'DISPATCHED', createdAt: '2026-11-20T22:05:00.000Z', total: 40, motoboy: { name: 'Motoboy Teste' } },
+    // Não são pedido (também têm uuid): nunca viram candidato.
+    { uuid: '11111111-1111-4111-8111-111111111111', name: 'Fulano de Tal', mobilePhone: '47999998888' },
+    { uuid: '22222222-2222-4222-8222-222222222222', code: '77', name: 'Pizza Grande', price: 50, status: 'active' },
+    { uuid: '33333333-3333-4333-8333-333333333333', name: 'Motoboy Teste', status: 'online' },
   ] } };
   ph3.respostas.set('https://api.menuintegrado.com.br/orders?status=open', { status: 200, texto: JSON.stringify(lista) });
   await ph3.painelPede('https://api.menuintegrado.com.br/orders?status=open', { method: 'GET' });
   const resumo = ph3.postados.find((m) => m.tipo === 'lista_pedidos');
   verificar('lista reconhecida: 2 pedidos com id, código e marca', resumo?.itens?.length === 2 && resumo.itens[0].id === UUID && resumo.itens[0].codigo === '537420' && resumo.itens[0].marca === 'hiperchefpizza', resumo);
+  verificar('lista: cliente, produto e motoboy (com uuid) NÃO viram candidato', resumo.itens.length === 2 && !resumo.itens.some((i) => /^(1|2|3)+-/.test(i.id)), resumo.itens.map((i) => i.id));
   verificar('lista sem nenhum dado de cliente/motoboy', !SENSIVEIS.concat(['Motoboy Teste']).some((v) => JSON.stringify(resumo).includes(v)));
   lista.data.orders[0].status = 'DISPATCHED';
   ph3.respostas.set('https://api.menuintegrado.com.br/orders?status=open', { status: 200, texto: JSON.stringify(lista) });
@@ -150,7 +155,12 @@ function criarPageHook() {
 // ---------------------------------------------- lista por HTML simples e WebSocket
 {
   const ph = criarPageHook();
-  const frag = `<div class="card status-producing"><a href="/orders/${UUID}" data-id="${UUID}">#537420 Fulano de Tal 19:05</a><span>Rua das Flores</span></div><div class="card"><a href="/orders/${UUID2}">#537421</a></div>`;
+  const ruido = `<img src="/img/${'44444444-4444-4444-8444-444444444444'}.png"><div data-customer-id="55555555-5555-4555-8555-555555555555"></div><a href="/clientes/66666666-6666-4666-8666-666666666666">x</a><div data-id="77777777-7777-4777-8777-777777777777"></div>`;
+  ph.respostas.set('https://painel.menuintegrado.com.br/outros', { status: 200, texto: ruido });
+  const antesRuido = ph.postados.filter((m) => m.tipo === 'lista_pedidos').length;
+  await ph.painelPede('https://painel.menuintegrado.com.br/outros', { method: 'GET' });
+  verificar('HTML: UUID em imagem, cliente, link de cliente ou data-id genérico NÃO vira candidato', ph.postados.filter((m) => m.tipo === 'lista_pedidos').length === antesRuido);
+  const frag = `<div class="card status-producing" data-order-uuid="${UUID}"><a href="/orders/${UUID}" data-id="${UUID}">#537420 Fulano de Tal 19:05</a><span>Rua das Flores</span></div><div class="card"><a href="/orders/${UUID2}">#537421</a></div>`;
   ph.respostas.set('https://painel.menuintegrado.com.br/orders/cards', { status: 200, texto: frag });
   await ph.painelPede('https://painel.menuintegrado.com.br/orders/cards', { method: 'GET' });
   const lh = ph.postados.filter((m) => m.tipo === 'lista_pedidos').at(-1);
@@ -193,15 +203,17 @@ function criarBackground(agoraInicial) {
     tabs: { sendMessage: (aba, msg) => { abasMsgs.push({ aba, msg }); return Promise.resolve({ aceito: true }); } },
   };
   const sb = { chrome, console: { ...console, error: () => {}, warn: () => {} }, crypto: globalThis.crypto, setImmediate, Response, URL, Date: FakeDate, setTimeout: () => 0,
-    fetch: (url, o) => { enviados.push(JSON.parse(o.body)); return Promise.resolve(new Response('{"ok":true}', { status: 200 })); } };
+    fetch: (url, o) => { const b = JSON.parse(o.body); enviados.push(b); return Promise.resolve(new Response(JSON.stringify(b.tipo === 'sinal_captura' ? (api.respostaSinal ?? { ok: true }) : { ok: true }), { status: 200 })); } };
+  const api = {};
   vm.createContext(sb); vm.runInContext(BACKGROUND, sb, { filename: 'background.js' });
   const msg = (m, aba = 7) => new Promise((r) => onMessage(m, { tab: { id: aba } }, r));
-  return {
+  return Object.assign(api, {
     dados, abasMsgs, enviados, alarmes, msg,
+    async sinal() { await onAlarm({ name: 'verys_mi_sinal' }); await esperar(); },
     avancar(min) { agora += min * 60000; },
     agora: () => agora,
     async rodada() { await onAlarm({ name: 'verys_mi_consulta' }); await esperar(); },
-  };
+  });
 }
 
 {
@@ -265,6 +277,7 @@ function criarBackground(agoraInicial) {
   verificar('aba no login: nenhuma consulta', bg.abasMsgs.length === 0);
 
   // Id incerto (achado em HTML/push) que não é pedido: 1 consulta e descarta.
+  for (const it of muitos) await bg.msg({ type: 'pedido_observado', payload: { id: it.id, createdAt: it.criadoEm, merchant: { name: 'x' }, customer: {}, statusHistory: [{ status: 'Entregue' }] } });
   bg.avancar(1);
   await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7);
   await bg.msg({ type: 'lista_pedidos', itens: [{ id: 'dddddddd-1111-4222-8333-444455556666', assinatura: 'h1', incerto: true }] });
@@ -283,6 +296,20 @@ function criarBackground(agoraInicial) {
   verificar('sem conexão: pausa de 1 min e o pedido não acumula falha', pq.pausaMotivo === 'sem_conexao' && (pq.pedidos['eeeeeeee-1111-4222-8333-444455556666'].falhas || 0) === 0);
   bg.abasMsgs.length = 0; bg.avancar(1.1); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
   verificar('conexão de volta: consulta o pedido na rodada seguinte', bg.abasMsgs.some((x) => x.msg.pedidos.some((p) => p.id === 'eeeeeeee-1111-4222-8333-444455556666')));
+
+  // Recuperação pedida pelo VERYS: pedido antigo (fora das janelas), nunca visto.
+  const VELHO = 'ffffffff-1111-4222-8333-444455556666';
+  bg.dados.verys_mi_config = { ingestUrl: 'https://exemplo.invalido/ingest', token: 't' };
+  await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7);
+  bg.respostaSinal = { ok: true, situacao: { comprovada: false, lojas: [] }, paraConferir: [{ id: VELHO, marca: 'hiperchefpizza' }, { id: 'nao valido' }] };
+  await bg.sinal();
+  bg.abasMsgs.length = 0; await bg.rodada();
+  verificar('VERYS pede conferir pedido antigo: consultado mesmo fora da janela de 12 h', bg.abasMsgs.some((x) => x.msg.pedidos.some((p) => p.id === VELHO)));
+  verificar('id inválido na lista do VERYS é ignorado', !bg.dados.verys_mi_sync.pedidos['nao valido']);
+  await bg.msg({ type: 'pedido_observado', payload: { id: VELHO, createdAt: '2026-11-18T22:00:00.000Z', merchant: { name: 'hiperchefpizza' }, customer: {}, statusHistory: [{ status: 'Entregue' }] } });
+  await bg.sinal();
+  bg.abasMsgs.length = 0; bg.avancar(5); await bg.msg({ type: 'painel_presente', paginaLogin: false }, 7); await bg.rodada();
+  verificar('depois de conferido (entregue), não repete mesmo se o VERYS ainda listar por alguns minutos', !bg.abasMsgs.some((x) => x.msg.pedidos.some((p) => p.id === VELHO)));
 
   // Resumo para o popup.
   const stats = await bg.msg({ type: 'obter_stats' });

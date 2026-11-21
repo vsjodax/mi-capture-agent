@@ -357,6 +357,10 @@ async function enviarSinal() {
   const sinal = await montarSinal(Date.now());
   const resultado = await tentarEnviar(sinal, config);
   const situacao = resultado.enviado && resultado.corpo && typeof resultado.corpo.situacao === 'object' ? resultado.corpo.situacao : null;
+  if (resultado.enviado && Array.isArray(resultado.corpo?.paraConferir)) {
+    await registrarParaConferir(resultado.corpo.paraConferir);
+    agendarRodada();
+  }
   await chrome.storage.local.set({
     [STORAGE_KEYS.ultimoSinal]: { em: new Date().toISOString(), ok: resultado.enviado, motivo: resultado.motivo ?? null, situacao },
   });
@@ -389,6 +393,12 @@ const PAUSA_LIMITE_MS = 5 * 60 * 1000; // 429
 const PAUSA_SERVIDOR_MS = 2 * 60 * 1000; // 5xx
 const PAUSA_SEM_CONEXAO_MS = 60 * 1000; // erro de rede: tenta de novo logo
 const MAX_PEDIDOS_SYNC = 400;
+const MAX_INCERTOS_POR_RODADA = 2;
+// Pedidos que o VERYS pede para conferir (em andamento lá, sem sincronizar):
+// consultados mesmo fora das janelas acima — é a recuperação depois de queda.
+const JANELA_CONFERIR_MS = 72 * 60 * 60 * 1000;
+const RECONFERIR_MS = 15 * 60 * 1000;
+const MAX_PARA_CONFERIR = 100;
 
 function syncVazio() {
   return { modelo: null, pausaAte: null, pausaMotivo: null, pedidos: {}, consultas: [] };
@@ -398,7 +408,8 @@ const idValido = (id) => typeof id === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(i
 
 function podarSync(sync, agoraMs) {
   const limite = agoraMs - JANELA_ANDAMENTO_MS;
-  const recente = (p) => [p.listaEm, p.detalheEm, p.criadoEm].some((t) => t && Date.parse(t) >= limite);
+  const recente = (p) => [p.listaEm, p.detalheEm, p.criadoEm].some((t) => t && Date.parse(t) >= limite)
+    || (p.conferirEm && Date.parse(p.conferirEm) >= agoraMs - JANELA_CONFERIR_MS);
   const vivos = Object.entries(sync.pedidos || {})
     .filter(([, p]) => recente(p))
     .sort((a, b) => ((a[1].listaEm || a[1].detalheEm || '') < (b[1].listaEm || b[1].detalheEm || '') ? 1 : -1))
@@ -415,18 +426,34 @@ function escolherConsultas(sync, agoraMs) {
   const candidatos = [];
   for (const [id, p] of Object.entries(sync.pedidos || {})) {
     if (p.final) continue;
-    if (p.criadoEm && Date.parse(p.criadoEm) < limite) continue;
     const espera = p.falhas > 0 ? Math.min(2 ** p.falhas, 16) * 60 * 1000 : 0;
     if (p.buscaEm && agoraMs - Date.parse(p.buscaEm) < Math.max(espera, 60 * 1000)) continue;
+    // Pedido que o VERYS pediu para conferir e ainda não foi consultado depois
+    // do pedido: vai na frente, sem limite de idade.
+    if (p.conferirEm && (!p.detalheEm || p.detalheEm < p.conferirEm)) {
+      candidatos.push({ id, codigo: p.codigo ?? null, prioridade: 0, ref: p.conferirEm, incerto: false });
+      continue;
+    }
+    if (p.criadoEm && Date.parse(p.criadoEm) < limite) continue;
     const semDetalhe = !p.detalheEm;
     const mudou = p.mudouEm && (!p.detalheEm || p.detalheEm < p.mudouEm);
     const velho = p.detalheEm && agoraMs - Date.parse(p.detalheEm) >= REFRESH_MIN * 60 * 1000
       && (!p.criadoEm || Date.parse(p.criadoEm) >= agoraMs - JANELA_REFRESH_MS);
-    if (semDetalhe || mudou) candidatos.push({ id, codigo: p.codigo ?? null, prioridade: 0, ref: p.mudouEm || p.listaEm || '' });
-    else if (velho) candidatos.push({ id, codigo: p.codigo ?? null, prioridade: 1, ref: p.detalheEm });
+    if (semDetalhe || mudou) candidatos.push({ id, codigo: p.codigo ?? null, prioridade: 0, ref: p.mudouEm || p.listaEm || '', incerto: !!p.incerto });
+    else if (velho) candidatos.push({ id, codigo: p.codigo ?? null, prioridade: 1, ref: p.detalheEm, incerto: !!p.incerto });
   }
-  candidatos.sort((a, b) => a.prioridade - b.prioridade || (a.prioridade === 0 ? (a.ref < b.ref ? 1 : -1) : (a.ref < b.ref ? -1 : 1)));
-  return candidatos.slice(0, MAX_POR_RODADA).map(({ id, codigo }) => ({ id, codigo }));
+  // Confirmados antes dos incertos (achados só em HTML/push); no máximo
+  // MAX_INCERTOS_POR_RODADA incertos por rodada.
+  candidatos.sort((a, b) => a.prioridade - b.prioridade || Number(a.incerto) - Number(b.incerto) || (a.prioridade === 0 ? (a.ref < b.ref ? 1 : -1) : (a.ref < b.ref ? -1 : 1)));
+  const escolhidos = [];
+  let incertos = 0;
+  for (const c of candidatos) {
+    if (escolhidos.length >= MAX_POR_RODADA) break;
+    if (c.incerto && incertos >= MAX_INCERTOS_POR_RODADA) continue;
+    if (c.incerto) incertos += 1;
+    escolhidos.push({ id: c.id, codigo: c.codigo });
+  }
+  return escolhidos;
 }
 
 async function lerSync() {
@@ -472,6 +499,32 @@ async function registrarDetalhe(payload) {
     p.final = !!payload.cancelled || entregue;
     sync.pedidos[payload.id] = p;
     await chrome.storage.local.set({ [STORAGE_KEYS.sync]: podarSync(sync, Date.now()) });
+  });
+}
+
+// Lista que o VERYS devolve na resposta do sinal: pedidos em andamento lá sem
+// sincronização recente (ex.: os que ficaram parados numa queda). Só ids do MI.
+async function registrarParaConferir(lista) {
+  if (!Array.isArray(lista) || lista.length === 0) return;
+  await emSerie(async () => {
+    const sync = await lerSync();
+    const agoraMs = Date.now();
+    const agora = new Date(agoraMs).toISOString();
+    for (const item of lista.slice(0, MAX_PARA_CONFERIR)) {
+      const id = typeof item === 'string' ? item : item?.id;
+      if (!idValido(id)) continue;
+      const p = sync.pedidos[id] || { falhas: 0 };
+      if (p.descartado) continue;
+      const jaConferido = p.detalheEm && (!p.conferirEm || p.detalheEm >= p.conferirEm);
+      if (!p.conferirEm || (jaConferido && agoraMs - Date.parse(p.detalheEm) >= RECONFERIR_MS)) {
+        p.conferirEm = agora;
+        p.final = false;
+      }
+      p.incerto = false;
+      if (typeof item?.marca === 'string') p.marca = item.marca.slice(0, 120);
+      sync.pedidos[id] = p;
+    }
+    await chrome.storage.local.set({ [STORAGE_KEYS.sync]: podarSync(sync, agoraMs) });
   });
 }
 
